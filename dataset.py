@@ -1,6 +1,7 @@
 """
 dataset.py - MVTec AD dataset loader
 """
+from typing import List
 import os
 from pathlib import Path
 from PIL import Image
@@ -77,4 +78,32 @@ class MVTecDataset(Dataset):
             mask = (mask > 0.5).float()
         else:
             mask = torch.zeros(1, H, W)
+        return image, mask, label
+
+
+class MultiCategoryDataset(Dataset):
+    """
+    Combines normal (good) training images from multiple MVTec categories
+    into a single dataset so that one shared model can be trained on all.
+
+    Only supports split='train' (normal images only).
+    """
+
+    def __init__(self, root: str, categories: List[str], img_size: int = 224):
+        self.samples: list = []
+        for cat in categories:
+            cat_ds = MVTecDataset(root, cat, split='train', img_size=img_size)
+            self.samples.extend(cat_ds.samples)
+        # Reuse the transform from the last per-category dataset
+        self.transform       = cat_ds.transform
+        self.mask_transform  = cat_ds.mask_transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, mask_path, label = self.samples[idx]
+        image = self.transform(Image.open(img_path).convert('RGB'))
+        H, W = image.shape[1], image.shape[2]
+        mask = torch.zeros(1, H, W)   # train split → always normal, no mask
         return image, mask, label
