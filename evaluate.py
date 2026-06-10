@@ -1,11 +1,20 @@
 """
-evaluate.py - Evaluate PPAD on MVTec test set.
+evaluate.py - Evaluate PPAD on a test dataset.
 Computes image-level and pixel-level AUROC and saves per-image
 side-by-side visualizations: [Image | GT Mask | Anomaly Map].
 
-Example:
-  python evaluate.py --data_path /datasets/mvtec --category bottle \
-                     --ckpt_dir checkpoints --vis_dir visualizations
+Same-dataset evaluation:
+  python evaluate.py --dataset mvtec  --data_path /data/mvtec  --category bottle \
+                     --ckpt_dir checkpoints
+
+Cross-dataset (zero-shot) evaluation:
+  # Train on MVTec all, evaluate on VisA
+  python evaluate.py --dataset visa   --data_path /data/visa   --category all \
+                     --ckpt_dir checkpoints --ckpt_tag mvtec/all
+
+  # Train on VisA all, evaluate on MVTec2
+  python evaluate.py --dataset mvtec2 --data_path /data/mvtec2 --category all \
+                     --ckpt_dir checkpoints --ckpt_tag visa/all
 """
 
 import argparse
@@ -25,7 +34,7 @@ from sklearn.metrics import roc_auc_score, precision_recall_curve
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import MVTecDataset, MVTEC_CATEGORIES
+from dataset import make_dataset, ALL_CATEGORIES
 from model import PPAD
 
 
@@ -34,11 +43,18 @@ from model import PPAD
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Evaluate PPAD on MVTec')
-    p.add_argument('--data_path', required=True)
-    p.add_argument('--category',  required=True, help='Category name or "all"')
-    p.add_argument('--ckpt_dir',  default='checkpoints',
-                   help='Root checkpoint directory (expects <ckpt_dir>/<category>/best.pt)')
+    p = argparse.ArgumentParser(description='Evaluate PPAD')
+    p.add_argument('--dataset',    default='mvtec',
+                   help='Test dataset name: mvtec | mvtec2 | visa')
+    p.add_argument('--data_path',  required=True)
+    p.add_argument('--category',   required=True,
+                   help='Category name, "all", or comma-separated list')
+    p.add_argument('--ckpt_dir',   default='checkpoints',
+                   help='Root checkpoint directory')
+    p.add_argument('--ckpt_tag',   default=None,
+                   help='Checkpoint sub-path within --ckpt_dir to load from '
+                        '(default: <dataset>/<category>). Use this for cross-dataset '
+                        'eval, e.g. --ckpt_tag mvtec/all to load a model trained on MVTec.')
     p.add_argument('--batch_size', type=int, default=4)
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--vis_dir',    default='visualizations',
@@ -134,11 +150,11 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
 # Evaluate one category
 # ---------------------------------------------------------------------------
 
-def evaluate_category(args, category: str) -> dict:
+def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> dict:
     device = torch.device(args.device)
 
-    # Load checkpoint
-    ckpt_path = Path(args.ckpt_dir) / category / 'best.pt'
+    # Resolve checkpoint path
+    ckpt_path = Path(args.ckpt_dir) / ckpt_tag / 'best.pt'
     if not ckpt_path.exists():
         print(f'  [SKIP] No checkpoint found: {ckpt_path}')
         return {}
@@ -153,13 +169,14 @@ def evaluate_category(args, category: str) -> dict:
     model.predictor.load_state_dict(ckpt['predictor'])
     model.eval()
 
-    # Dataset — batch_size=1 so each image gets its own artifact file
-    dataset = MVTecDataset(args.data_path, category, split='test',
-                           img_size=ckpt['img_size'])
+    # Dataset — use the appropriate loader for the *test* dataset
+    dataset = make_dataset(dataset_name, args.data_path, category,
+                           split='test', img_size=ckpt['img_size'])
     loader  = DataLoader(dataset, batch_size=1, shuffle=False,
                          num_workers=4, pin_memory=True)
 
-    vis_dir = Path(args.vis_dir) / category
+    # Visualizations go under <vis_dir>/<dataset>/<category>/
+    vis_dir = Path(args.vis_dir) / dataset_name / category
     if not args.no_vis:
         vis_dir.mkdir(parents=True, exist_ok=True)
         print(f'  Saving visualizations → {vis_dir}')
@@ -169,7 +186,7 @@ def evaluate_category(args, category: str) -> dict:
 
     with torch.no_grad():
         for sample_idx, (images, masks, labels) in enumerate(
-                tqdm(loader, desc=f'  {category}')):
+                tqdm(loader, desc=f'  [{dataset_name}] {category}')):
             images = images.to(device)          # [1, 3, H, W]
 
             # Anomaly map [1, 1, H, W]
@@ -230,16 +247,45 @@ def evaluate_category(args, category: str) -> dict:
 
 def main():
     args = parse_args()
+    dataset_name = args.dataset
 
-    categories = MVTEC_CATEGORIES if args.category == 'all' else [args.category]
+    # Resolve categories
+    all_cats = ALL_CATEGORIES[dataset_name]
+    if args.category == 'all':
+        categories = all_cats
+    else:
+        categories = [c.strip() for c in args.category.split(',')]
+
+    # Resolve checkpoint tag
+    # Default: <dataset>/<category>  — matches what train.py writes
+    # Override with --ckpt_tag for cross-dataset eval (e.g. "mvtec/all")
+    default_tag = f'{dataset_name}/{categories[0]}' if len(categories) == 1 \
+                  else f'{dataset_name}/all'
 
     print(f'\n{"="*60}')
-    print(f'  PPAD Evaluation  |  ckpt_dir: {args.ckpt_dir}')
+    print(f'  PPAD Evaluation  |  dataset: {dataset_name}')
+    print(f'  ckpt_dir: {args.ckpt_dir}')
+    if args.ckpt_tag:
+        print(f'  ckpt_tag: {args.ckpt_tag}  (cross-dataset eval)')
     print(f'{"="*60}')
 
     results = {}
     for cat in categories:
-        results[cat] = evaluate_category(args, cat)
+        # Each category can have its own per-category checkpoint, or all
+        # categories share one checkpoint (multi-category / cross-dataset).
+        if args.ckpt_tag:
+            # Explicit override: use the same checkpoint for all test categories
+            tag = args.ckpt_tag
+        elif len(categories) == 1:
+            tag = f'{dataset_name}/{cat}'
+        else:
+            # Multi-cat eval: look for a per-category ckpt, fall back to
+            # the shared 'all' checkpoint for this dataset.
+            per_cat_ckpt = Path(args.ckpt_dir) / dataset_name / cat / 'best.pt'
+            tag = f'{dataset_name}/{cat}' if per_cat_ckpt.exists() \
+                  else f'{dataset_name}/all'
+
+        results[cat] = evaluate_category(args, dataset_name, cat, tag)
 
     # Summary
     valid = {k: v for k, v in results.items() if v}
@@ -251,7 +297,7 @@ def main():
                             if not np.isnan(v['seg_f1'])])
         print(f'\n  Mean img-AUROC: {mean_img:.1f}%   Mean px-AUROC: {mean_px:.1f}%   Mean seg-F1: {mean_f1:.1f}%')
 
-    # Save results JSON
+    # Save results JSON next to the checkpoint dir
     out = Path(args.ckpt_dir) / 'results.json'
     with open(out, 'w') as f:
         json.dump(results, f, indent=2)
