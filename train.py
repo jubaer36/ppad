@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument('--category',     required=True,
                    help='Category name, "all", or comma-separated list (e.g. bottle,cable)')
     p.add_argument('--output_dir',   default='checkpoints', help='Where to save checkpoints')
-    p.add_argument('--patch_grid',   type=int,   default=4,     help='Patches per dim (4→16 patches)')
+    p.add_argument('--patch_grids',  default='4,8,16',     help='Comma-separated list of patch grids (e.g. 4,8,16)')
     p.add_argument('--img_size',     type=int,   default=224)
     p.add_argument('--encoder',      default='dinov2_vits14')
     p.add_argument('--epochs',       type=int,   default=50)
@@ -68,12 +68,19 @@ def train_category(args, dataset_name: str, category: str):
                          num_workers=4, pin_memory=True, drop_last=True)
     print(f'  Training images: {len(dataset)}')
 
+    # Clean up GPU memory before model instantiation
+    import gc
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     # Model — encoder is frozen inside PPAD
-    model = PPAD(patch_grid=args.patch_grid, img_size=args.img_size,
+    grids = [int(g.strip()) for g in args.patch_grids.split(',')]
+    model = PPAD(patch_grids=grids, img_size=args.img_size,
                  encoder_name=args.encoder).to(device)
 
     # Only optimise predictor parameters
-    optimizer = torch.optim.AdamW(model.predictor.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.predictors.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_loss = float('inf')
@@ -86,25 +93,17 @@ def train_category(args, dataset_name: str, category: str):
 
         for images, _, _ in tqdm(loader, desc=f'Epoch {epoch}/{args.epochs}', leave=False):
             images = images.to(device)
-            B, N   = images.shape[0], model.num_patches
 
-            # ---- encode (no grad, encoder is frozen) ----
-            hp = model._encode_all_patches(images)    # [B, N, D]
-            hi = model._encode_all_contexts(images)   # [B, N, D]
-
-            # ---- predict (differentiable) ----
-            hi_flat  = hi.reshape(B * N, -1)
-            idx_flat = torch.arange(N, device=device).repeat(B)
-            ho_flat  = model.predictor(hi_flat, idx_flat)            # [B*N, D]
-
-            ho = ho_flat.view(B, N, -1)                              # [B, N, D]
-
-            # Cosine-similarity loss on normalized vectors
-            loss = (1.0 - F.cosine_similarity(ho, hp, dim=-1)).mean()
+            # ---- forward & predict ----
+            outputs = model(images)
+            loss = 0.0
+            for g, (hp, ho) in outputs.items():
+                loss += (1.0 - F.cosine_similarity(ho, hp, dim=-1)).mean()
+            loss /= len(outputs)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.predictor.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.predictors.parameters(), 1.0)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -118,8 +117,8 @@ def train_category(args, dataset_name: str, category: str):
             ckpt = {
                 'epoch':       epoch,
                 'loss':        best_loss,
-                'predictor':   model.predictor.state_dict(),
-                'patch_grid':  args.patch_grid,
+                'predictors':  model.predictors.state_dict(),
+                'patch_grids': model.patch_grids,
                 'img_size':    args.img_size,
                 'encoder':     args.encoder,
                 'dataset':     dataset_name,
@@ -150,11 +149,18 @@ def train_all(args, dataset_name: str, categories: list):
                          num_workers=4, pin_memory=True, drop_last=True)
     print(f'  Total training images: {len(dataset)}')
 
+    # Clean up GPU memory before model instantiation
+    import gc
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     # One model for all categories
-    model = PPAD(patch_grid=args.patch_grid, img_size=args.img_size,
+    grids = [int(g.strip()) for g in args.patch_grids.split(',')]
+    model = PPAD(patch_grids=grids, img_size=args.img_size,
                  encoder_name=args.encoder).to(device)
 
-    optimizer = torch.optim.AdamW(model.predictor.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.predictors.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_loss = float('inf')
@@ -167,21 +173,17 @@ def train_all(args, dataset_name: str, categories: list):
 
         for images, _, _ in tqdm(loader, desc=f'Epoch {epoch}/{args.epochs}', leave=False):
             images = images.to(device)
-            B, N   = images.shape[0], model.num_patches
 
-            hp = model._encode_all_patches(images)    # [B, N, D]
-            hi = model._encode_all_contexts(images)   # [B, N, D]
-
-            hi_flat  = hi.reshape(B * N, -1)
-            idx_flat = torch.arange(N, device=device).repeat(B)
-            ho_flat  = model.predictor(hi_flat, idx_flat)
-
-            ho   = ho_flat.view(B, N, -1)
-            loss = (1.0 - F.cosine_similarity(ho, hp, dim=-1)).mean()
+            # ---- forward & predict ----
+            outputs = model(images)
+            loss = 0.0
+            for g, (hp, ho) in outputs.items():
+                loss += (1.0 - F.cosine_similarity(ho, hp, dim=-1)).mean()
+            loss /= len(outputs)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.predictor.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.predictors.parameters(), 1.0)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -195,8 +197,8 @@ def train_all(args, dataset_name: str, categories: list):
             ckpt = {
                 'epoch':      epoch,
                 'loss':       best_loss,
-                'predictor':  model.predictor.state_dict(),
-                'patch_grid': args.patch_grid,
+                'predictors': model.predictors.state_dict(),
+                'patch_grids': model.patch_grids,
                 'img_size':   args.img_size,
                 'encoder':    args.encoder,
                 'dataset':    dataset_name,

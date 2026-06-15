@@ -246,12 +246,18 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
 
     ckpt = torch.load(ckpt_path, map_location=device)
 
+    # Clean up GPU memory before model instantiation
+    import gc
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     model = PPAD(
-        patch_grid   = ckpt['patch_grid'],
+        patch_grids  = ckpt.get('patch_grids', [4, 8, 16]),
         img_size     = ckpt['img_size'],
         encoder_name = ckpt['encoder'],
     ).to(device)
-    model.predictor.load_state_dict(ckpt['predictor'])
+    model.predictors.load_state_dict(ckpt['predictors'])
     model.eval()
 
     # Dataset — use the appropriate loader for the *test* dataset
@@ -274,16 +280,9 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
                 tqdm(loader, desc=f'  [{dataset_name}] {category}')):
             images = images.to(device)          # [1, 3, H, W]
 
-            # Raw patch scores [1, N] — native resolution, no upsampling
-            patch_scores = model(images)                        # [1, N]
-
-            # Upsample to pixel-level heatmap [1, 1, H, W] without a 2nd fwd pass
-            g = model.patch_grid
-            H, W = images.shape[2], images.shape[3]
-            heatmap = F.interpolate(
-                patch_scores.view(-1, 1, g, g),
-                size=(H, W), mode='bilinear', align_corners=False,
-            )                                                   # [1, 1, H, W]
+            # Multi-scale returns a dict containing fused heatmap and individual scale scores
+            outputs = model(images)
+            heatmap = outputs['fused']                          # [1, 1, H, W]
 
             # Image-level score = max over spatial positions
             img_score = heatmap.flatten(1).max(dim=1).values  # [1]
@@ -313,10 +312,11 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
 
                 # Patch-grid visualization (raw scores vs downsampled mask)
                 grid_fname = f'{sample_idx:04d}_{status_str}_patchgrid.png'
+                vis_grid = 8 if 8 in model.patch_grids else model.patch_grids[len(model.patch_grids)//2]
                 save_patch_grid_visualization(
-                    patch_scores = patch_scores[0],
+                    patch_scores = outputs[vis_grid][0],
                     mask_tensor  = masks[0, 0],
-                    patch_grid   = model.patch_grid,
+                    patch_grid   = vis_grid,
                     label        = label_int,
                     img_score    = score_val,
                     save_path    = vis_dir / grid_fname,

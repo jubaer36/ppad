@@ -46,9 +46,10 @@ def main():
     ckpt_path = Path(args.ckpt_dir) / args.category / 'best.pt'
     ckpt      = torch.load(ckpt_path, map_location=device)
 
-    model = PPAD(patch_grid=ckpt['patch_grid'], img_size=ckpt['img_size'],
+    model = PPAD(patch_grids=ckpt.get('patch_grids', [4, 8, 16]),
+                 img_size=ckpt['img_size'],
                  encoder_name=ckpt['encoder']).to(device)
-    model.predictor.load_state_dict(ckpt['predictor'])
+    model.predictors.load_state_dict(ckpt['predictors'])
     model.eval()
 
     dataset = MVTecDataset(args.data_path, args.category, split='test',

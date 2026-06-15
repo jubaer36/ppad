@@ -81,49 +81,59 @@ class PatchPredictor(nn.Module):
 
 class PPAD(nn.Module):
     """
-    Patch Predictive Anomaly Detection.
+    Patch Predictive Anomaly Detection (Multi-scale Grid).
 
     Args:
-        patch_grid  : patches per spatial dimension (patch_grid x patch_grid total)
+        patch_grids : list of patch grid sizes (e.g. [4, 8, 16])
         img_size    : input image size (square)
         encoder_name: DINOv2 variant (dinov2_vits14 / dinov2_vitb14 / ...)
     """
 
-    def __init__(self, patch_grid: int = 4, img_size: int = 224,
+    def __init__(self, patch_grids: list = [4, 8, 16], img_size: int = 224,
                  encoder_name: str = 'dinov2_vits14'):
         super().__init__()
-        self.patch_grid  = patch_grid
+        self.patch_grids = patch_grids
         self.img_size    = img_size
-        self.num_patches = patch_grid * patch_grid
-        self.patch_size  = img_size // patch_grid   # pixels per patch side
 
         self.encoder   = DINOv2Encoder(encoder_name)
-        self.predictor = PatchPredictor(
-            embed_dim   = self.encoder.embed_dim,
-            num_patches = self.num_patches,
-        )
+        self.predictors = nn.ModuleDict({
+            str(g): PatchPredictor(
+                embed_dim   = self.encoder.embed_dim,
+                num_patches = g * g,
+            )
+            for g in patch_grids
+        })
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _patch_coords(self, idx: int):
-        """Return (r0, r1, c0, c1) pixel slice for patch index idx."""
-        ps = self.patch_size
-        r  = idx // self.patch_grid
-        c  = idx  % self.patch_grid
-        return r * ps, (r + 1) * ps, c * ps, (c + 1) * ps
+    def _patch_coords(self, idx: int, g: int):
+        """Return (r0, r1, c0, c1) pixel slice for patch index idx at grid scale g."""
+        ps = self.img_size // g
+        w  = self.img_size
+        r  = idx // g
+        c  = idx  % g
 
-    def _encode_all_patches(self, images: torch.Tensor) -> torch.Tensor:
+        if g > 1:
+            r0 = int(r * (w - ps) / (g - 1))
+            c0 = int(c * (w - ps) / (g - 1))
+        else:
+            r0 = 0
+            c0 = 0
+
+        return r0, r0 + ps, c0, c0 + ps
+
+    def _encode_all_patches(self, images: torch.Tensor, g: int) -> torch.Tensor:
         """
         Crop every patch from every image, resize to img_size, encode.
         images : [B, 3, H, W]
         returns: [B, N, D]
         """
-        B, N = images.shape[0], self.num_patches
+        B, N = images.shape[0], g * g
         crops = []
         for idx in range(N):
-            r0, r1, c0, c1 = self._patch_coords(idx)
+            r0, r1, c0, c1 = self._patch_coords(idx, g)
             p = images[:, :, r0:r1, c0:c1]                         # [B, 3, ps, ps]
             p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
             crops.append(p)                                          # [B, 3, H, W]
@@ -133,16 +143,16 @@ class PPAD(nn.Module):
         hp_cat    = self.encoder(crops_cat)                         # [B*N, D]
         return hp_cat.view(N, B, -1).permute(1, 0, 2)              # [B, N, D]
 
-    def _encode_all_contexts(self, images: torch.Tensor) -> torch.Tensor:
+    def _encode_all_contexts(self, images: torch.Tensor, g: int) -> torch.Tensor:
         """
         For each patch position, zero it out and encode the resulting image.
         images : [B, 3, H, W]
         returns: [B, N, D]
         """
-        B, N = images.shape[0], self.num_patches
+        B, N = images.shape[0], g * g
         masked_list = []
         for idx in range(N):
-            r0, r1, c0, c1 = self._patch_coords(idx)
+            r0, r1, c0, c1 = self._patch_coords(idx, g)
             m = images.clone()
             m[:, :, r0:r1, c0:c1] = 0.0   # 0 ≈ ImageNet mean after normalization
             masked_list.append(m)           # [B, 3, H, W]
@@ -158,32 +168,72 @@ class PPAD(nn.Module):
     def forward(self, images: torch.Tensor):
         """
         images: [B, 3, H, W] (normalized)
-        Returns patch_scores [B, N] — higher = more anomalous.
-        Only the predictor is differentiable; encoder is frozen.
+
+        If self.training is True:
+            Returns a dict {g: (hp_g, ho_g)} for each grid size g in self.patch_grids
+        If self.training is False:
+            Returns a dict containing:
+                - 'fused': average fused pixel-level anomaly map [B, 1, H, W]
+                - g (int): individual scale scores [B, N_g]
         """
-        B, N = images.shape[0], self.num_patches
+        B = images.shape[0]
+        device = images.device
 
-        hp = self._encode_all_patches(images)    # [B, N, D]  — no grad
-        hi = self._encode_all_contexts(images)   # [B, N, D]  — no grad
+        if self.training:
+            outputs = {}
+            for g in self.patch_grids:
+                N = g * g
+                with torch.no_grad():
+                    hp = self._encode_all_patches(images, g)    # [B, N, D]
+                    hi = self._encode_all_contexts(images, g)   # [B, N, D]
 
-        # Flatten spatial dims for predictor
-        hi_flat  = hi.reshape(B * N, -1)                                # [B*N, D]
-        idx_flat = torch.arange(N, device=images.device).repeat(B)      # [B*N]
-        ho_flat  = self.predictor(hi_flat, idx_flat)                    # [B*N, D]
+                # Flatten spatial dims for predictor
+                hi_flat  = hi.reshape(B * N, -1)                                # [B*N, D]
+                idx_flat = torch.arange(N, device=device).repeat(B)      # [B*N]
+                ho_flat  = self.predictors[str(g)](hi_flat, idx_flat)           # [B*N, D]
 
-        ho = ho_flat.view(B, N, -1)                                     # [B, N, D]
+                ho = ho_flat.view(B, N, -1)                                     # [B, N, D]
+                outputs[g] = (hp, ho)
+            return outputs
+        else:
+            outputs = {}
+            heatmaps = []
+            H, W = images.shape[2], images.shape[3]
 
-        # 1 - cosine similarity as anomaly score
-        scores = 1.0 - F.cosine_similarity(hp, ho, dim=-1)             # [B, N]
-        return scores
+            for g in self.patch_grids:
+                N = g * g
+                with torch.no_grad():
+                    hp = self._encode_all_patches(images, g)    # [B, N, D]
+                    hi = self._encode_all_contexts(images, g)   # [B, N, D]
+
+                    hi_flat  = hi.reshape(B * N, -1)
+                    idx_flat = torch.arange(N, device=device).repeat(B)
+                    ho_flat  = self.predictors[str(g)](hi_flat, idx_flat)
+
+                    ho = ho_flat.view(B, N, -1)
+                    scores = 1.0 - F.cosine_similarity(hp, ho, dim=-1)             # [B, N]
+                    outputs[g] = scores
+
+                    # Upsample to pixel-level heatmap
+                    grid = scores.view(B, 1, g, g)  # [B, 1, g, g]
+                    heatmap_g = F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False) # [B, 1, H, W]
+                    heatmaps.append(heatmap_g)
+
+            # Average (fuse) the upsampled anomaly maps
+            fused_heatmap = torch.stack(heatmaps, dim=0).mean(dim=0)  # [B, 1, H, W]
+            outputs['fused'] = fused_heatmap
+            return outputs
 
     def get_anomaly_map(self, images: torch.Tensor) -> torch.Tensor:
         """
-        Upsample patch scores to a per-pixel heatmap.
+        Returns the fused per-pixel anomaly map.
         images: [B, 3, H, W]
         Returns: [B, 1, H, W]
         """
-        scores = self.forward(images)                                   # [B, N]
-        H, W   = images.shape[2], images.shape[3]
-        grid   = scores.view(-1, 1, self.patch_grid, self.patch_grid)  # [B, 1, g, g]
-        return F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False)
+        was_training = self.training
+        self.eval()
+        outputs = self.forward(images)
+        if was_training:
+            self.train()
+        return outputs['fused']
+

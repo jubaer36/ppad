@@ -131,7 +131,8 @@ python visualize.py \
 | Arg | Default | Notes |
 |---|---|---|
 | `--dataset` | `mvtec` | Dataset to train/evaluate on |
-| `--patch_grid` | `4` | 4×4 = 16 patches per image |
+| `--patch_grid` | `8` | 8×8 = 64 patches per image |
+| `--patch_size` | `56` | Size of each patch (defaults to 56 for overlapping 8x8) |
 | `--encoder` | `dinov2_vits14` | Swap to `dinov2_vitb14` for stronger features |
 | `--epochs` | `50` | ~10 min per category on a single GPU |
 | `--lr` | `1e-4` | AdamW with cosine decay |
