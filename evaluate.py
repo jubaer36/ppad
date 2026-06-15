@@ -146,6 +146,91 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
     plt.close(fig)
 
 
+def save_patch_grid_visualization(
+    patch_scores: torch.Tensor,
+    mask_tensor: torch.Tensor,
+    patch_grid: int,
+    label: int,
+    img_score: float,
+    save_path: Path,
+):
+    """
+    Save a 2-panel figure showing the raw, un-upsampled patch-score grid
+    next to the GT mask downsampled to the same (patch_grid × patch_grid)
+    resolution.
+
+    Parameters
+    ----------
+    patch_scores : [N]  raw patch anomaly scores  (N = patch_grid²)
+    mask_tensor  : [H, W]  GT binary mask at original resolution
+    patch_grid   : int  patches per spatial dim  (e.g. 4 or 14)
+    label        : 0=normal, 1=anomaly
+    img_score    : scalar image-level anomaly score
+    save_path    : output .png path
+    """
+    g = patch_grid
+
+    # Reshape raw scores to grid
+    score_grid = patch_scores.cpu().float().numpy().reshape(g, g)        # [g, g]
+
+    # Downsample the GT mask to the same grid via adaptive avg-pool
+    mask_hw = mask_tensor.cpu().float()                                  # [H, W]
+    mask_4d = mask_hw.unsqueeze(0).unsqueeze(0)                          # [1,1,H,W]
+    mask_ds = F.adaptive_avg_pool2d(mask_4d, (g, g)).squeeze().numpy()   # [g, g]
+
+    # ----- Plot -----
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.2),
+                             gridspec_kw={'wspace': 0.30})
+    fig.patch.set_facecolor('#1a1a2e')
+
+    status = 'ANOMALY' if label == 1 else 'NORMAL'
+    status_color = 'tomato' if label == 1 else 'lightgreen'
+
+    # Panel 1 — Raw patch scores
+    im0 = axes[0].imshow(score_grid, cmap='hot', interpolation='nearest')
+    axes[0].set_title(
+        f'Patch Scores ({g}×{g})  [{status}]\nscore={img_score:.3f}',
+        color=status_color, fontsize=10, pad=6,
+    )
+    axes[0].set_xticks(range(g))
+    axes[0].set_yticks(range(g))
+    axes[0].tick_params(colors='white', labelsize=7)
+    # Annotate each cell with its score value
+    for r in range(g):
+        for c in range(g):
+            val = score_grid[r, c]
+            text_color = 'black' if val > (score_grid.max() + score_grid.min()) / 2 else 'white'
+            axes[0].text(c, r, f'{val:.2f}', ha='center', va='center',
+                         fontsize=max(5, 9 - g // 3), color=text_color)
+    cb0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    cb0.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cb0.ax.yaxis.get_ticklabels(), color='white', fontsize=7)
+
+    # Panel 2 — Downsampled GT mask
+    im1 = axes[1].imshow(mask_ds, cmap='gray', vmin=0.0, vmax=1.0, interpolation='nearest')
+    axes[1].set_title(
+        f'GT Mask ↓{g}×{g}  (avg-pool)',
+        color='white', fontsize=10, pad=6,
+    )
+    axes[1].set_xticks(range(g))
+    axes[1].set_yticks(range(g))
+    axes[1].tick_params(colors='white', labelsize=7)
+    for r in range(g):
+        for c in range(g):
+            val = mask_ds[r, c]
+            text_color = 'black' if val > 0.5 else 'white'
+            axes[1].text(c, r, f'{val:.2f}', ha='center', va='center',
+                         fontsize=max(5, 9 - g // 3), color=text_color)
+    cb1 = fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    cb1.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cb1.ax.yaxis.get_ticklabels(), color='white', fontsize=7)
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=130, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Evaluate one category
 # ---------------------------------------------------------------------------
@@ -189,8 +274,16 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
                 tqdm(loader, desc=f'  [{dataset_name}] {category}')):
             images = images.to(device)          # [1, 3, H, W]
 
-            # Anomaly map [1, 1, H, W]
-            heatmap = model.get_anomaly_map(images)
+            # Raw patch scores [1, N] — native resolution, no upsampling
+            patch_scores = model(images)                        # [1, N]
+
+            # Upsample to pixel-level heatmap [1, 1, H, W] without a 2nd fwd pass
+            g = model.patch_grid
+            H, W = images.shape[2], images.shape[3]
+            heatmap = F.interpolate(
+                patch_scores.view(-1, 1, g, g),
+                size=(H, W), mode='bilinear', align_corners=False,
+            )                                                   # [1, 1, H, W]
 
             # Image-level score = max over spatial positions
             img_score = heatmap.flatten(1).max(dim=1).values  # [1]
@@ -216,6 +309,17 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
                     label          = label_int,
                     img_score      = score_val,
                     save_path      = vis_dir / fname,
+                )
+
+                # Patch-grid visualization (raw scores vs downsampled mask)
+                grid_fname = f'{sample_idx:04d}_{status_str}_patchgrid.png'
+                save_patch_grid_visualization(
+                    patch_scores = patch_scores[0],
+                    mask_tensor  = masks[0, 0],
+                    patch_grid   = model.patch_grid,
+                    label        = label_int,
+                    img_score    = score_val,
+                    save_path    = vis_dir / grid_fname,
                 )
 
     img_scores = np.concatenate(img_scores)

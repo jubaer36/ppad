@@ -83,6 +83,27 @@ class MVTecDataset(Dataset):
                             mask = None
                     self.samples.append((p, mask, label))
 
+        if len(self.samples) == 0:
+            msg = f"No samples found for category '{category}', split '{split}' under split dir: {split_dir}\n"
+            if not self.root.exists():
+                msg += f"Root directory '{self.root}' does not exist. Please check your data_path setting."
+            elif not (self.root / category).exists():
+                subdirs = [p.name for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')]
+                msg += f"Category directory '{category}' not found under root '{self.root}'. Available directories: {subdirs}"
+            elif not split_dir.exists():
+                msg += f"Split directory '{split}' not found under '{self.root / category}'."
+            else:
+                if split == 'train':
+                    good_dir = split_dir / 'good'
+                    if not good_dir.exists():
+                        msg += f"Good directory '{good_dir}' does not exist."
+                    else:
+                        all_files = [p.name for p in good_dir.glob('*') if not p.name.startswith('.')][:5]
+                        msg += f"Good directory exists but no matching files found. Checked extensions: png, jpg, bmp. Found files: {all_files}"
+                else:
+                    msg += f"No test classes or files found under '{split_dir}'."
+            raise ValueError(msg)
+
     def __len__(self):
         return len(self.samples)
 
@@ -182,6 +203,22 @@ class MVTec2Dataset(Dataset):
                             break
                     self.samples.append((p, mask, 1))
 
+        if len(self.samples) == 0:
+            msg = f"No samples found for category '{category}', split '{split}'.\n"
+            if not self.root.exists():
+                msg += f"Root directory '{self.root}' does not exist. Please check your data_path setting."
+            elif not cat_dir.exists():
+                subdirs = [p.name for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')]
+                msg += f"Category directory '{category}' not found under root '{self.root}'. Available directories: {subdirs}"
+            else:
+                target_dir = cat_dir / 'train' if split == 'train' else cat_dir / 'test_public'
+                if not target_dir.exists():
+                    msg += f"Target directory '{target_dir}' does not exist."
+                else:
+                    all_files = [p.name for p in target_dir.glob('*') if not p.name.startswith('.')][:5]
+                    msg += f"Directory exists but no matching files with extensions {self._EXTS}. Found files: {all_files}"
+            raise ValueError(msg)
+
     def __len__(self):
         return len(self.samples)
 
@@ -256,6 +293,19 @@ class VisADataset(Dataset):
             ):
                 mask = mask_dir / (p.stem + '.png')
                 self.samples.append((p, mask if mask.exists() else None, 1))
+
+        if len(self.samples) == 0:
+            msg = f"No samples found for category '{category}', split '{split}'.\n"
+            if not self.root.exists():
+                msg += f"Root directory '{self.root}' does not exist. Please check your data_path setting."
+            elif not (self.root / category).exists():
+                subdirs = [p.name for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')]
+                msg += f"Category directory '{category}' not found under root '{self.root}'. Available directories: {subdirs}"
+            elif not data_dir.exists():
+                msg += f"Data directory '{data_dir}' does not exist under '{self.root / category}'."
+            else:
+                msg += f"Checked normal_dir={normal_dir}. Directory exists={normal_dir.exists()}."
+            raise ValueError(msg)
 
     def __len__(self):
         return len(self.samples)
