@@ -104,7 +104,7 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
     heat_norm = (heat_np - h_min) / (h_max - h_min + 1e-8)
 
     # Blend heatmap over image (alpha composite)
-    cmap   = cm.get_cmap('hot')
+    cmap   = plt.get_cmap('hot')
     heat_rgb = cmap(heat_norm)[..., :3]                    # [H, W, 3]
     blend    = 0.55 * img_np + 0.45 * heat_rgb             # [H, W, 3]
     blend    = np.clip(blend, 0.0, 1.0)

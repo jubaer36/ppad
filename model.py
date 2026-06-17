@@ -138,9 +138,16 @@ class PPAD(nn.Module):
             p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
             crops.append(p)                                          # [B, 3, H, W]
 
-        # Stack → [B*N, 3, H, W] for one batched encoder call
+        # Stack → [B*N, 3, H, W]
         crops_cat = torch.cat(crops, dim=0)                         # [B*N, 3, H, W]
-        hp_cat    = self.encoder(crops_cat)                         # [B*N, D]
+        
+        # Encode in chunks to prevent CUDA OOM
+        max_batch_size = 64
+        hp_list = []
+        for i in range(0, crops_cat.shape[0], max_batch_size):
+            chunk = crops_cat[i:i + max_batch_size]
+            hp_list.append(self.encoder(chunk))
+        hp_cat = torch.cat(hp_list, dim=0)                          # [B*N, D]
         return hp_cat.view(N, B, -1).permute(1, 0, 2)              # [B, N, D]
 
     def _encode_all_contexts(self, images: torch.Tensor, g: int) -> torch.Tensor:
@@ -157,8 +164,16 @@ class PPAD(nn.Module):
             m[:, :, r0:r1, c0:c1] = 0.0   # 0 ≈ ImageNet mean after normalization
             masked_list.append(m)           # [B, 3, H, W]
 
+        # Stack → [B*N, 3, H, W]
         masked_cat = torch.cat(masked_list, dim=0)                  # [B*N, 3, H, W]
-        hi_cat     = self.encoder(masked_cat)                       # [B*N, D]
+        
+        # Encode in chunks to prevent CUDA OOM
+        max_batch_size = 64
+        hi_list = []
+        for i in range(0, masked_cat.shape[0], max_batch_size):
+            chunk = masked_cat[i:i + max_batch_size]
+            hi_list.append(self.encoder(chunk))
+        hi_cat = torch.cat(hi_list, dim=0)                          # [B*N, D]
         return hi_cat.view(N, B, -1).permute(1, 0, 2)              # [B, N, D]
 
     # ------------------------------------------------------------------
