@@ -51,85 +51,6 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
-# Training for one category
-# ---------------------------------------------------------------------------
-
-def train_category(args, dataset_name: str, category: str):
-    print(f'\n{"="*60}')
-    print(f'  Training [{dataset_name}]: {category}')
-    print(f'{"="*60}')
-
-    device = torch.device(args.device)
-
-    # Dataset
-    dataset = make_dataset(dataset_name, args.data_path, category,
-                           split='train', img_size=args.img_size)
-    loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                         num_workers=4, pin_memory=True, drop_last=True)
-    print(f'  Training images: {len(dataset)}')
-
-    # Clean up GPU memory before model instantiation
-    import gc
-    gc.collect()
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    # Model — encoder is frozen inside PPAD
-    grids = [int(g.strip()) for g in args.patch_grids.split(',')]
-    model = PPAD(patch_grids=grids, img_size=args.img_size,
-                 encoder_name=args.encoder).to(device)
-
-    # Only optimise predictor parameters
-    optimizer = torch.optim.AdamW(model.predictors.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    best_loss = float('inf')
-    out_dir   = Path(args.output_dir) / dataset_name / category
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        epoch_loss = 0.0
-
-        for images, _, _ in tqdm(loader, desc=f'Epoch {epoch}/{args.epochs}', leave=False):
-            images = images.to(device)
-
-            # ---- forward & predict ----
-            outputs = model(images)
-            loss = 0.0
-            for g, (hp, ho) in outputs.items():
-                loss += (1.0 - F.cosine_similarity(ho, hp, dim=-1)).mean()
-            loss /= len(outputs)
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.predictors.parameters(), 1.0)
-            optimizer.step()
-
-            epoch_loss += loss.item()
-
-        scheduler.step()
-        avg_loss = epoch_loss / len(loader)
-        print(f'  Epoch {epoch:3d} | loss: {avg_loss:.4f} | lr: {scheduler.get_last_lr()[0]:.2e}')
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            ckpt = {
-                'epoch':       epoch,
-                'loss':        best_loss,
-                'predictors':  model.predictors.state_dict(),
-                'patch_grids': model.patch_grids,
-                'img_size':    args.img_size,
-                'encoder':     args.encoder,
-                'dataset':     dataset_name,
-                'categories':  [category],
-            }
-            torch.save(ckpt, out_dir / 'best.pt')
-
-    print(f'  Saved best checkpoint → {out_dir / "best.pt"}  (loss={best_loss:.4f})')
-
-
-# ---------------------------------------------------------------------------
 # Training on a combined multi-category dataset (one shared model)
 # ---------------------------------------------------------------------------
 
@@ -146,7 +67,7 @@ def train_all(args, dataset_name: str, categories: list):
     dataset = make_dataset(dataset_name, args.data_path, categories,
                            split='train', img_size=args.img_size)
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                         num_workers=4, pin_memory=True, drop_last=True)
+                         num_workers=4, pin_memory=True, drop_last=(len(dataset) >= args.batch_size))
     print(f'  Total training images: {len(dataset)}')
 
     # Clean up GPU memory before model instantiation
@@ -224,12 +145,13 @@ def main():
     else:
         categories = [c.strip() for c in args.category.split(',')]
 
-    if len(categories) == 1:
-        # Single category → per-category checkpoint
-        train_category(args, dataset_name, categories[0])
-    else:
-        # Multiple categories → one shared model
-        train_all(args, dataset_name, categories)
+    # Filter to categories present on disk
+    categories = [cat for cat in categories if (Path(args.data_path) / cat).exists()]
+    if len(categories) == 0:
+        raise ValueError(f"None of the requested categories exist under data_path: {args.data_path}")
+
+    # Train a single model on all categories combined
+    train_all(args, dataset_name, categories)
 
 
 if __name__ == '__main__':

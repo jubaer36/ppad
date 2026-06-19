@@ -366,6 +366,11 @@ def make_dataset(
     if isinstance(categories, str):
         categories = all_cats if categories == 'all' else [c.strip() for c in categories.split(',')]
 
+    # Filter out categories whose directories do not exist under root
+    categories = [cat for cat in categories if (Path(root) / cat).exists()]
+    if len(categories) == 0:
+        raise ValueError(f"None of the requested categories exist under root '{root}'")
+
     datasets = [cls(root, cat, split=split, img_size=img_size) for cat in categories]
     if len(datasets) == 1:
         return datasets[0]

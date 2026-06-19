@@ -30,7 +30,8 @@ from matplotlib.colors import Normalize
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+from skimage.measure import label, regionprops
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -235,6 +236,72 @@ def save_patch_grid_visualization(
 # Evaluate one category
 # ---------------------------------------------------------------------------
 
+def calculate_pro(masks, scores, max_steps=200, expect_fpr=0.3):
+    """
+    Compute Per-Region Overlap (PRO) score.
+    masks: [N, H, W] binary ground truth
+    scores: [N, H, W] anomaly scores
+    """
+    thresholds = np.linspace(scores.min(), scores.max(), max_steps)
+    pros = []
+    fprs = []
+
+    # Identify regions once to save computation time
+    labeled_masks = []
+    all_regions = []
+    for mask in masks:
+        labeled = label(mask)
+        regions = regionprops(labeled)
+        labeled_masks.append(labeled)
+        all_regions.append(regions)
+
+    for threshold in thresholds:
+        binary_scores = (scores > threshold).astype(int)
+
+        # Calculate Pro
+        pro_values = []
+        for i, binary_score in enumerate(binary_scores):
+            regions = all_regions[i]
+            for region in regions:
+                tp_pixels = binary_score[region.coords[:, 0], region.coords[:, 1]].sum()
+                pro_values.append(tp_pixels / region.area)
+        
+        if len(pro_values) > 0:
+            pros.append(np.mean(pro_values))
+        else:
+            pros.append(0.0)
+
+        # Calculate FPR
+        inverse_masks = 1 - masks
+        fp_pixels = np.logical_and(inverse_masks, binary_scores).sum()
+        if inverse_masks.sum() > 0:
+            fpr = fp_pixels / inverse_masks.sum()
+        else:
+            fpr = 0.0
+        fprs.append(fpr)
+
+    pros = np.array(pros)
+    fprs = np.array(fprs)
+
+    # Filter FPRs below the expected threshold
+    valid_idxs = fprs <= expect_fpr
+    fprs = fprs[valid_idxs]
+    pros = pros[valid_idxs]
+
+    # Sort by fprs in ascending order for metrics.auc
+    if len(fprs) > 1:
+        sort_idx = np.argsort(fprs)
+        fprs = fprs[sort_idx]
+        pros = pros[sort_idx]
+        # Normalize
+        fprs = (fprs - fprs.min()) / (fprs.max() - fprs.min() + 1e-8)
+        pro_auc = auc(fprs, pros)
+    else:
+        pro_auc = 0.0
+
+    return pro_auc
+
+
 def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> dict:
     device = torch.device(args.device)
 
@@ -264,7 +331,7 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
     dataset = make_dataset(dataset_name, args.data_path, category,
                            split='test', img_size=ckpt['img_size'])
     loader  = DataLoader(dataset, batch_size=1, shuffle=False,
-                         num_workers=4, pin_memory=True)
+                          num_workers=4, pin_memory=True)
 
     # Visualizations go under <vis_dir>/<dataset>/<category>/
     vis_dir = Path(args.vis_dir) / dataset_name / category
@@ -319,20 +386,23 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
                     patch_grid   = vis_grid,
                     label        = label_int,
                     img_score    = score_val,
-                    save_path    = vis_dir / grid_fname,
+                    save_path      = vis_dir / grid_fname,
                 )
+
+    px_scores_3d = np.concatenate(px_scores, axis=0)  # [N, H, W]
+    px_labels_3d = np.concatenate(px_labels, axis=0)  # [N, H, W]
 
     img_scores = np.concatenate(img_scores)
     img_labels = np.concatenate(img_labels)
-    px_scores  = np.concatenate(px_scores).ravel()
-    px_labels  = np.concatenate(px_labels).ravel().astype(int)
+    px_scores_flat  = px_scores_3d.ravel()
+    px_labels_flat  = px_labels_3d.ravel().astype(int)
 
     img_auroc = roc_auc_score(img_labels, img_scores) * 100
-    px_auroc  = roc_auc_score(px_labels,  px_scores)  * 100 if px_labels.sum() > 0 else float('nan')
+    px_auroc  = roc_auc_score(px_labels_flat,  px_scores_flat)  * 100 if px_labels_flat.sum() > 0 else float('nan')
 
     # Seg-F1: find optimal threshold per category from GT pixel labels
-    if px_labels.sum() > 0:
-        precision, recall, thresholds = precision_recall_curve(px_labels, px_scores)
+    if px_labels_flat.sum() > 0:
+        precision, recall, thresholds = precision_recall_curve(px_labels_flat, px_scores_flat)
         f1_per_thresh = 2 * precision * recall / (precision + recall + 1e-8)
         best_idx  = int(np.argmax(f1_per_thresh))
         seg_f1    = float(f1_per_thresh[best_idx]) * 100
@@ -341,8 +411,14 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
         seg_f1    = float('nan')
         threshold = float('nan')
 
-    print(f'  {category:<15} img-AUROC: {img_auroc:.1f}%   px-AUROC: {px_auroc:.1f}%   seg-F1: {seg_f1:.1f}%  (thr={threshold:.4f})')
-    return {'img_auroc': img_auroc, 'px_auroc': px_auroc, 'seg_f1': seg_f1, 'threshold': threshold}
+    # PRO Score
+    if px_labels_3d.sum() > 0:
+        pro_score = calculate_pro(px_labels_3d, px_scores_3d) * 100
+    else:
+        pro_score = float('nan')
+
+    print(f'  {category:<15} img-AUROC: {img_auroc:.1f}%   px-AUROC: {px_auroc:.1f}%   PRO: {pro_score:.1f}%   seg-F1: {seg_f1:.1f}%  (thr={threshold:.4f})')
+    return {'img_auroc': img_auroc, 'px_auroc': px_auroc, 'pro_score': pro_score, 'seg_f1': seg_f1, 'threshold': threshold}
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +436,10 @@ def main():
     else:
         categories = [c.strip() for c in args.category.split(',')]
 
-    # Resolve checkpoint tag
-    # Default: <dataset>/<category>  — matches what train.py writes
-    # Override with --ckpt_tag for cross-dataset eval (e.g. "mvtec/all")
-    default_tag = f'{dataset_name}/{categories[0]}' if len(categories) == 1 \
-                  else f'{dataset_name}/all'
+    # Filter to categories present on disk
+    categories = [cat for cat in categories if (Path(args.data_path) / cat).exists()]
+    if len(categories) == 0:
+        raise ValueError(f"None of the requested categories exist under data_path: {args.data_path}")
 
     print(f'\n{"="*60}')
     print(f'  PPAD Evaluation  |  dataset: {dataset_name}')
@@ -375,19 +450,21 @@ def main():
 
     results = {}
     for cat in categories:
-        # Each category can have its own per-category checkpoint, or all
-        # categories share one checkpoint (multi-category / cross-dataset).
+        # Locate the best.pt checkpoint path robustly
         if args.ckpt_tag:
-            # Explicit override: use the same checkpoint for all test categories
             tag = args.ckpt_tag
-        elif len(categories) == 1:
-            tag = f'{dataset_name}/{cat}'
         else:
-            # Multi-cat eval: look for a per-category ckpt, fall back to
-            # the shared 'all' checkpoint for this dataset.
-            per_cat_ckpt = Path(args.ckpt_dir) / dataset_name / cat / 'best.pt'
-            tag = f'{dataset_name}/{cat}' if per_cat_ckpt.exists() \
-                  else f'{dataset_name}/all'
+            parent_dir = Path(args.ckpt_dir) / dataset_name
+            if (parent_dir / 'all' / 'best.pt').exists():
+                tag = f'{dataset_name}/all'
+            elif (parent_dir / cat / 'best.pt').exists():
+                tag = f'{dataset_name}/{cat}'
+            else:
+                candidates = list(parent_dir.glob('**/best.pt'))
+                if candidates:
+                    tag = str(candidates[0].parent.relative_to(args.ckpt_dir))
+                else:
+                    tag = f'{dataset_name}/all'
 
         results[cat] = evaluate_category(args, dataset_name, cat, tag)
 
@@ -397,15 +474,48 @@ def main():
         mean_img = np.mean([v['img_auroc'] for v in valid.values()])
         mean_px  = np.mean([v['px_auroc'] for v in valid.values()
                             if not np.isnan(v['px_auroc'])])
+        mean_pro = np.mean([v['pro_score'] for v in valid.values()
+                            if not np.isnan(v['pro_score'])])
         mean_f1  = np.mean([v['seg_f1']   for v in valid.values()
                             if not np.isnan(v['seg_f1'])])
-        print(f'\n  Mean img-AUROC: {mean_img:.1f}%   Mean px-AUROC: {mean_px:.1f}%   Mean seg-F1: {mean_f1:.1f}%')
+        print(f'\n  Mean img-AUROC: {mean_img:.1f}%   Mean px-AUROC: {mean_px:.1f}%   Mean PRO: {mean_pro:.1f}%   Mean seg-F1: {mean_f1:.1f}%')
+    elif len(valid) == 1:
+        v = list(valid.values())[0]
+        mean_img = v['img_auroc']
+        mean_px  = v['px_auroc']
+        mean_pro = v['pro_score']
+        mean_f1  = v['seg_f1']
 
-    # Save results JSON next to the checkpoint dir
-    out = Path(args.ckpt_dir) / 'results.json'
-    with open(out, 'w') as f:
+    # Save results JSON and CSV next to the checkpoint dir
+    out_json = Path(args.ckpt_dir) / 'results.json'
+    with open(out_json, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f'\n  Results saved → {out}')
+    print(f'\n  Results saved → {out_json}')
+
+    out_csv = Path(args.ckpt_dir) / 'results.csv'
+    import csv
+    with open(out_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Class', 'Image_AUROC', 'Pixel_AUROC', 'Region_of_Overlap_PRO', 'Seg_F1'])
+        for cat, metrics_dict in results.items():
+            if metrics_dict:
+                writer.writerow([
+                    cat,
+                    f"{metrics_dict['img_auroc']:.2f}",
+                    f"{metrics_dict['px_auroc']:.2f}" if not np.isnan(metrics_dict['px_auroc']) else 'NaN',
+                    f"{metrics_dict['pro_score']:.2f}" if not np.isnan(metrics_dict['pro_score']) else 'NaN',
+                    f"{metrics_dict['seg_f1']:.2f}" if not np.isnan(metrics_dict['seg_f1']) else 'NaN'
+                ])
+        # Write mean row
+        if len(valid) >= 1:
+            writer.writerow([
+                'MEAN',
+                f"{mean_img:.2f}",
+                f"{mean_px:.2f}" if not np.isnan(mean_px) else 'NaN',
+                f"{mean_pro:.2f}" if not np.isnan(mean_pro) else 'NaN',
+                f"{mean_f1:.2f}" if not np.isnan(mean_f1) else 'NaN'
+            ])
+    print(f'  CSV results saved → {out_csv}')
 
 
 if __name__ == '__main__':
