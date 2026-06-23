@@ -126,7 +126,7 @@ class PPAD(nn.Module):
 
     def _encode_all_patches(self, images: torch.Tensor, g: int) -> torch.Tensor:
         """
-        Crop every patch from every image, resize to img_size, encode.
+        Crop every patch from every image and encode directly at native crop size.
         images : [B, 3, H, W]
         returns: [B, N, D]
         """
@@ -135,11 +135,10 @@ class PPAD(nn.Module):
         for idx in range(N):
             r0, r1, c0, c1 = self._patch_coords(idx, g)
             p = images[:, :, r0:r1, c0:c1]                         # [B, 3, ps, ps]
-            p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
-            crops.append(p)                                          # [B, 3, H, W]
+            crops.append(p)                                          # [B, 3, ps, ps]
 
-        # Stack → [B*N, 3, H, W]
-        crops_cat = torch.cat(crops, dim=0)                         # [B*N, 3, H, W]
+        # Stack → [B*N, 3, ps, ps]
+        crops_cat = torch.cat(crops, dim=0)                         # [B*N, 3, ps, ps]
         
         # Encode in chunks to prevent CUDA OOM
         max_batch_size = 64

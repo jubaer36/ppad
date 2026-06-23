@@ -85,10 +85,22 @@ def train_all(args, dataset_name: str, categories: list):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_loss = float('inf')
+    start_epoch = 1
     out_dir   = Path(args.output_dir) / dataset_name / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
+    latest_ckpt_path = out_dir / 'latest.pt'
+    if latest_ckpt_path.exists():
+        print(f"  Found latest checkpoint: {latest_ckpt_path}, resuming...")
+        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        model.predictors.load_state_dict(ckpt['predictors'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        start_epoch = ckpt['epoch'] + 1
+        best_loss = ckpt['best_loss']
+        print(f"  Resuming from epoch {start_epoch} with best_loss {best_loss:.4f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
 
@@ -126,8 +138,24 @@ def train_all(args, dataset_name: str, categories: list):
                 'categories': categories,
             }
             torch.save(ckpt, out_dir / 'best.pt')
+            print(f'  Saved best checkpoint → {out_dir / "best.pt"}  (loss={best_loss:.4f})')
 
-    print(f'  Saved best checkpoint → {out_dir / "best.pt"}  (loss={best_loss:.4f})')
+        # Save latest checkpoint after every epoch
+        latest_ckpt = {
+            'epoch':      epoch,
+            'best_loss':  best_loss,
+            'predictors': model.predictors.state_dict(),
+            'optimizer':  optimizer.state_dict(),
+            'scheduler':  scheduler.state_dict(),
+            'patch_grids': model.patch_grids,
+            'img_size':   args.img_size,
+            'encoder':    args.encoder,
+            'dataset':    dataset_name,
+            'categories': categories,
+        }
+        torch.save(latest_ckpt, out_dir / 'latest.pt')
+
+    print(f'  Training complete. Best loss={best_loss:.4f}')
 
 
 # ---------------------------------------------------------------------------
