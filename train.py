@@ -43,6 +43,7 @@ def parse_args():
     p.add_argument('--patch_grids',  default='4,8,16',     help='Comma-separated list of patch grids (e.g. 4,8,16)')
     p.add_argument('--img_size',     type=int,   default=224)
     p.add_argument('--encoder',      default='dinov2_vits14')
+    p.add_argument('--layers',       default='2,5,8,11', help='Comma-separated DINOv2 layers to extract')
     p.add_argument('--epochs',       type=int,   default=50)
     p.add_argument('--batch_size',   type=int,   default=8)
     p.add_argument('--lr',           type=float, default=1e-4)
@@ -78,8 +79,9 @@ def train_all(args, dataset_name: str, categories: list):
 
     # One model for all categories
     grids = [int(g.strip()) for g in args.patch_grids.split(',')]
+    layers = [int(l.strip()) for l in args.layers.split(',')]
     model = PPAD(patch_grids=grids, img_size=args.img_size,
-                 encoder_name=args.encoder).to(device)
+                 encoder_name=args.encoder, layers=layers).to(device)
 
     optimizer = torch.optim.AdamW(model.predictors.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -136,6 +138,7 @@ def train_all(args, dataset_name: str, categories: list):
                 'encoder':    args.encoder,
                 'dataset':    dataset_name,
                 'categories': categories,
+                'layers':     model.layers,
             }
             torch.save(ckpt, out_dir / 'best.pt')
             print(f'  Saved best checkpoint → {out_dir / "best.pt"}  (loss={best_loss:.4f})')
@@ -152,6 +155,7 @@ def train_all(args, dataset_name: str, categories: list):
             'encoder':    args.encoder,
             'dataset':    dataset_name,
             'categories': categories,
+            'layers':     model.layers,
         }
         torch.save(latest_ckpt, out_dir / 'latest.pt')
 

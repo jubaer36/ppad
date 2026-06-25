@@ -20,8 +20,9 @@ import torch.nn.functional as F
 class DINOv2Encoder(nn.Module):
     """Wraps a frozen DINOv2 model; returns the CLS token."""
 
-    def __init__(self, model_name: str = 'dinov2_vits14'):
+    def __init__(self, model_name: str = 'dinov2_vits14', layers: list = [2, 5, 8, 11]):
         super().__init__()
+        self.layers = layers
         self.model = torch.hub.load('facebookresearch/dinov2', model_name)
         self.model.eval()
         for p in self.model.parameters():
@@ -30,8 +31,10 @@ class DINOv2Encoder(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, 3, 224, 224] normalized → returns [B, D]"""
-        return self.model(x)
+        """x: [B, 3, 224, 224] normalized → returns [L, B, D]"""
+        out = self.model.get_intermediate_layers(x, n=self.layers, return_class_token=True)
+        cls_tokens = [o[1] for o in out]
+        return torch.stack(cls_tokens, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -90,17 +93,21 @@ class PPAD(nn.Module):
     """
 
     def __init__(self, patch_grids: list = [4, 8, 16], img_size: int = 224,
-                 encoder_name: str = 'dinov2_vits14'):
+                 encoder_name: str = 'dinov2_vits14', layers: list = [2, 5, 8, 11]):
         super().__init__()
         self.patch_grids = patch_grids
         self.img_size    = img_size
+        self.layers      = layers
 
-        self.encoder   = DINOv2Encoder(encoder_name)
+        self.encoder   = DINOv2Encoder(encoder_name, layers=layers)
         self.predictors = nn.ModuleDict({
-            str(g): PatchPredictor(
-                embed_dim   = self.encoder.embed_dim,
-                num_patches = g * g,
-            )
+            str(g): nn.ModuleList([
+                PatchPredictor(
+                    embed_dim   = self.encoder.embed_dim,
+                    num_patches = g * g,
+                )
+                for _ in range(len(self.layers))
+            ])
             for g in patch_grids
         })
 
@@ -126,34 +133,35 @@ class PPAD(nn.Module):
 
     def _encode_all_patches(self, images: torch.Tensor, g: int) -> torch.Tensor:
         """
-        Crop every patch from every image and encode directly at native crop size.
+        Crop every patch from every image, resize to img_size, encode.
         images : [B, 3, H, W]
-        returns: [B, N, D]
+        returns: [L, B, N, D]
         """
         B, N = images.shape[0], g * g
         crops = []
         for idx in range(N):
             r0, r1, c0, c1 = self._patch_coords(idx, g)
             p = images[:, :, r0:r1, c0:c1]                         # [B, 3, ps, ps]
-            crops.append(p)                                          # [B, 3, ps, ps]
+            p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
+            crops.append(p)                                          # [B, 3, H, W]
 
-        # Stack → [B*N, 3, ps, ps]
-        crops_cat = torch.cat(crops, dim=0)                         # [B*N, 3, ps, ps]
+        # Stack → [B*N, 3, H, W]
+        crops_cat = torch.cat(crops, dim=0)                         # [B*N, 3, H, W]
         
         # Encode in chunks to prevent CUDA OOM
         max_batch_size = 64
         hp_list = []
         for i in range(0, crops_cat.shape[0], max_batch_size):
             chunk = crops_cat[i:i + max_batch_size]
-            hp_list.append(self.encoder(chunk))
-        hp_cat = torch.cat(hp_list, dim=0)                          # [B*N, D]
-        return hp_cat.view(N, B, -1).permute(1, 0, 2)              # [B, N, D]
+            hp_list.append(self.encoder(chunk))                     # [L, B_chunk, D]
+        hp_cat = torch.cat(hp_list, dim=1)                          # [L, B*N, D]
+        return hp_cat.view(len(self.layers), N, B, -1).permute(0, 2, 1, 3) # [L, B, N, D]
 
     def _encode_all_contexts(self, images: torch.Tensor, g: int) -> torch.Tensor:
         """
         For each patch position, zero it out and encode the resulting image.
         images : [B, 3, H, W]
-        returns: [B, N, D]
+        returns: [L, B, N, D]
         """
         B, N = images.shape[0], g * g
         masked_list = []
@@ -171,9 +179,9 @@ class PPAD(nn.Module):
         hi_list = []
         for i in range(0, masked_cat.shape[0], max_batch_size):
             chunk = masked_cat[i:i + max_batch_size]
-            hi_list.append(self.encoder(chunk))
-        hi_cat = torch.cat(hi_list, dim=0)                          # [B*N, D]
-        return hi_cat.view(N, B, -1).permute(1, 0, 2)              # [B, N, D]
+            hi_list.append(self.encoder(chunk))                     # [L, B_chunk, D]
+        hi_cat = torch.cat(hi_list, dim=1)                          # [L, B*N, D]
+        return hi_cat.view(len(self.layers), N, B, -1).permute(0, 2, 1, 3) # [L, B, N, D]
 
     # ------------------------------------------------------------------
     # Forward
@@ -198,15 +206,18 @@ class PPAD(nn.Module):
             for g in self.patch_grids:
                 N = g * g
                 with torch.no_grad():
-                    hp = self._encode_all_patches(images, g)    # [B, N, D]
-                    hi = self._encode_all_contexts(images, g)   # [B, N, D]
+                    hp = self._encode_all_patches(images, g)    # [L, B, N, D]
+                    hi = self._encode_all_contexts(images, g)   # [L, B, N, D]
 
-                # Flatten spatial dims for predictor
-                hi_flat  = hi.reshape(B * N, -1)                                # [B*N, D]
-                idx_flat = torch.arange(N, device=device).repeat(B)      # [B*N]
-                ho_flat  = self.predictors[str(g)](hi_flat, idx_flat)           # [B*N, D]
+                ho_layers = []
+                for l in range(len(self.layers)):
+                    hi_l = hi[l] # [B, N, D]
+                    hi_flat  = hi_l.reshape(B * N, -1)                                # [B*N, D]
+                    idx_flat = torch.arange(N, device=device).repeat(B)      # [B*N]
+                    ho_flat  = self.predictors[str(g)][l](hi_flat, idx_flat)           # [B*N, D]
+                    ho_layers.append(ho_flat.view(B, N, -1))
 
-                ho = ho_flat.view(B, N, -1)                                     # [B, N, D]
+                ho = torch.stack(ho_layers, dim=0)                                     # [L, B, N, D]
                 outputs[g] = (hp, ho)
             return outputs
         else:
@@ -217,15 +228,21 @@ class PPAD(nn.Module):
             for g in self.patch_grids:
                 N = g * g
                 with torch.no_grad():
-                    hp = self._encode_all_patches(images, g)    # [B, N, D]
-                    hi = self._encode_all_contexts(images, g)   # [B, N, D]
+                    hp = self._encode_all_patches(images, g)    # [L, B, N, D]
+                    hi = self._encode_all_contexts(images, g)   # [L, B, N, D]
 
-                    hi_flat  = hi.reshape(B * N, -1)
-                    idx_flat = torch.arange(N, device=device).repeat(B)
-                    ho_flat  = self.predictors[str(g)](hi_flat, idx_flat)
+                    scores_layers = []
+                    for l in range(len(self.layers)):
+                        hi_l = hi[l]
+                        hi_flat  = hi_l.reshape(B * N, -1)
+                        idx_flat = torch.arange(N, device=device).repeat(B)
+                        ho_flat  = self.predictors[str(g)][l](hi_flat, idx_flat)
+                        ho_l = ho_flat.view(B, N, -1)
+                        
+                        scores_l = 1.0 - F.cosine_similarity(hp[l], ho_l, dim=-1)             # [B, N]
+                        scores_layers.append(scores_l)
 
-                    ho = ho_flat.view(B, N, -1)
-                    scores = 1.0 - F.cosine_similarity(hp, ho, dim=-1)             # [B, N]
+                    scores = torch.stack(scores_layers, dim=0).mean(dim=0)
                     outputs[g] = scores
 
                     # Upsample to pixel-level heatmap

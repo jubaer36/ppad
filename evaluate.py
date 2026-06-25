@@ -57,6 +57,7 @@ def parse_args():
                         '(default: <dataset>/<category>). Use this for cross-dataset '
                         'eval, e.g. --ckpt_tag mvtec/all to load a model trained on MVTec.')
     p.add_argument('--batch_size', type=int, default=4)
+    p.add_argument('--layers',     default='2,5,8,11', help='Comma-separated DINOv2 layers to extract')
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--vis_dir',    default='visualizations',
                    help='Root directory for per-image artifacts')
@@ -323,6 +324,7 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
         patch_grids  = ckpt.get('patch_grids', [4, 8, 16]),
         img_size     = ckpt['img_size'],
         encoder_name = ckpt['encoder'],
+        layers       = ckpt.get('layers', [int(l.strip()) for l in args.layers.split(',')]),
     ).to(device)
     model.predictors.load_state_dict(ckpt['predictors'])
     model.eval()
