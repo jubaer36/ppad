@@ -255,6 +255,148 @@ class PPAD(nn.Module):
             outputs['fused'] = fused_heatmap
             return outputs
 
+    # ------------------------------------------------------------------
+    # Checkerboard masking helpers
+    # ------------------------------------------------------------------
+
+    def _checkerboard_indices(self, g: int):
+        """
+        Split the g×g patch grid into two checkerboard halves.
+        Returns (black_indices, white_indices) where:
+          black = patches at (r, c) with (r + c) % 2 == 0
+          white = patches at (r, c) with (r + c) % 2 == 1
+        """
+        black, white = [], []
+        for r in range(g):
+            for c in range(g):
+                idx = r * g + c
+                if (r + c) % 2 == 0:
+                    black.append(idx)
+                else:
+                    white.append(idx)
+        return black, white
+
+    def _encode_patches_subset(self, images: torch.Tensor, g: int,
+                               indices: list) -> torch.Tensor:
+        """
+        Crop and encode only the patches at the given indices.
+        images : [B, 3, H, W]
+        indices: list of patch indices to encode
+        returns: [L, B, len(indices), D]
+        """
+        B = images.shape[0]
+        K = len(indices)
+        crops = []
+        for idx in indices:
+            r0, r1, c0, c1 = self._patch_coords(idx, g)
+            p = images[:, :, r0:r1, c0:c1]
+            p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
+            crops.append(p)
+
+        crops_cat = torch.cat(crops, dim=0)                         # [B*K, 3, H, W]
+
+        max_batch_size = 64
+        hp_list = []
+        for i in range(0, crops_cat.shape[0], max_batch_size):
+            chunk = crops_cat[i:i + max_batch_size]
+            hp_list.append(self.encoder(chunk))                     # [L, chunk, D]
+        hp_cat = torch.cat(hp_list, dim=1)                          # [L, B*K, D]
+        return hp_cat.view(len(self.layers), K, B, -1).permute(0, 2, 1, 3)  # [L, B, K, D]
+
+    def _encode_checkerboard_context(self, images: torch.Tensor, g: int,
+                                     mask_indices: list) -> torch.Tensor:
+        """
+        Zero out ALL patches at mask_indices simultaneously, encode once.
+        images      : [B, 3, H, W]
+        mask_indices: list of patch indices to zero out
+        returns     : [L, B, D]  (single context embedding per image)
+        """
+        m = images.clone()
+        for idx in mask_indices:
+            r0, r1, c0, c1 = self._patch_coords(idx, g)
+            m[:, :, r0:r1, c0:c1] = 0.0
+        ctx = self.encoder(m)                                       # [L, B, D]
+        return ctx
+
+    # ------------------------------------------------------------------
+    # Checkerboard forward (eval only)
+    # ------------------------------------------------------------------
+
+    def forward_checkerboard(self, images: torch.Tensor):
+        """
+        Checkerboard evaluation: mask n/2 patches at once in two passes.
+
+        Pass 1: mask "black" patches (r+c even), predict their embeddings
+        Pass 2: mask "white" patches (r+c odd),  predict their embeddings
+
+        Returns the same dict format as forward() in eval mode:
+          - 'fused': [B, 1, H, W] averaged anomaly heatmap
+          - g (int): [B, N] per-patch scores for each grid scale
+        """
+        assert not self.training, "forward_checkerboard is eval-only"
+        B = images.shape[0]
+        device = images.device
+        H, W = images.shape[2], images.shape[3]
+
+        outputs = {}
+        heatmaps = []
+
+        for g in self.patch_grids:
+            N = g * g
+            black_idx, white_idx = self._checkerboard_indices(g)
+
+            # Full score tensor to fill
+            all_scores = torch.zeros(B, N, device=device)
+
+            with torch.no_grad():
+                for mask_indices, predict_indices in [
+                    (black_idx, black_idx),   # Pass 1: mask black, predict black
+                    (white_idx, white_idx),   # Pass 2: mask white, predict white
+                ]:
+                    K = len(predict_indices)
+
+                    # 1. Encode isolated crops for the patches we want to predict
+                    hp = self._encode_patches_subset(images, g, predict_indices)  # [L, B, K, D]
+
+                    # 2. Encode context (all masked patches zeroed simultaneously)
+                    hi = self._encode_checkerboard_context(images, g, mask_indices)  # [L, B, D]
+
+                    # 3. Predict embeddings for each masked patch
+                    scores_layers = []
+                    for l_idx in range(len(self.layers)):
+                        hi_l = hi[l_idx]                            # [B, D]
+                        # Repeat context for each of the K patches
+                        hi_expanded = hi_l.unsqueeze(1).expand(B, K, -1)  # [B, K, D]
+                        hi_flat = hi_expanded.reshape(B * K, -1)          # [B*K, D]
+
+                        # Patch position indices
+                        idx_tensor = torch.tensor(predict_indices, device=device)  # [K]
+                        idx_flat = idx_tensor.unsqueeze(0).expand(B, -1).reshape(B * K)  # [B*K]
+
+                        ho_flat = self.predictors[str(g)][l_idx](hi_flat, idx_flat)  # [B*K, D]
+                        ho_l = ho_flat.view(B, K, -1)                                # [B, K, D]
+
+                        scores_l = 1.0 - F.cosine_similarity(hp[l_idx], ho_l, dim=-1)  # [B, K]
+                        scores_layers.append(scores_l)
+
+                    # Average across layers
+                    scores = torch.stack(scores_layers, dim=0).mean(dim=0)  # [B, K]
+
+                    # Scatter into full score tensor
+                    idx_tensor = torch.tensor(predict_indices, device=device)
+                    all_scores[:, idx_tensor] = scores
+
+            outputs[g] = all_scores  # [B, N]
+
+            # Upsample to pixel-level heatmap
+            grid = all_scores.view(B, 1, g, g)
+            heatmap_g = F.interpolate(grid, size=(H, W), mode='bilinear', align_corners=False)
+            heatmaps.append(heatmap_g)
+
+        fused_heatmap = torch.stack(heatmaps, dim=0).mean(dim=0)
+        outputs['fused'] = fused_heatmap
+        return outputs
+
     def get_anomaly_map(self, images: torch.Tensor) -> torch.Tensor:
         """
         Returns the fused per-pixel anomaly map.

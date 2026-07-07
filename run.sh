@@ -67,4 +67,19 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# 3. Evaluate with checkerboard masking
+echo -e "\n>>> Starting Checkerboard Evaluation..."
+python evaluate.py \
+    --dataset "$DATASET" \
+    --data_path "$DATA_PATH" \
+    --category "$CATEGORY" \
+    --ckpt_dir "$CKPT_DIR" \
+    --checkerboard \
+    --vis_dir "visualizations_checkerboard"
+
+if [ $? -ne 0 ]; then
+    echo "Checkerboard evaluation failed!"
+    exit 1
+fi
+
 echo -e "\n>>> PPAD Pipeline completed successfully!"

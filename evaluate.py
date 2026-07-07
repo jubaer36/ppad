@@ -63,6 +63,8 @@ def parse_args():
                    help='Root directory for per-image artifacts')
     p.add_argument('--no_vis',     action='store_true',
                    help='Skip saving visualization images')
+    p.add_argument('--checkerboard', action='store_true',
+                   help='Use checkerboard masking (mask n/2 patches at once in 2 passes)')
     return p.parse_args()
 
 
@@ -350,7 +352,10 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
             images = images.to(device)          # [1, 3, H, W]
 
             # Multi-scale returns a dict containing fused heatmap and individual scale scores
-            outputs = model(images)
+            if args.checkerboard:
+                outputs = model.forward_checkerboard(images)
+            else:
+                outputs = model(images)
             heatmap = outputs['fused']                          # [1, 1, H, W]
 
             # Image-level score = max over spatial positions
