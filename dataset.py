@@ -27,6 +27,10 @@ MVTEC2_CATEGORIES = [
     'rice_bag', 'wallplugs', 'walnuts', 'capacitor',
 ]
 
+MVTEC_LOCO_CATEGORIES = [
+    'breakfast_box', 'juice_bottle', 'pushpins', 'screw_bag', 'splicing_connectors'
+]
+
 VISA_CATEGORIES = [
     'capsules', 'candle', 'pcb1', 'pcb2', 'pcb3', 'pcb4',
     'macaroni1', 'macaroni2', 'cashew', 'chewinggum', 'fryum', 'pipe_fryum',
@@ -238,6 +242,114 @@ class MVTec2Dataset(Dataset):
 # VisA
 # ---------------------------------------------------------------------------
 
+class MVTecLOCODataset(Dataset):
+    """
+    MVTec LOCO AD dataset loader.
+
+    Directory layout expected:
+      <root>/<category>/train/good/                 normal training images
+      <root>/<category>/test/good/                  normal test images
+      <root>/<category>/test/<anomaly_type>/        anomalous test images
+      <root>/<category>/ground_truth/<anomaly_type>/<image_name>/000.png...
+    
+    If multiple ground truth masks exist for one image, they are combined with logical OR.
+    """
+
+    _EXTS = ('.png', '.jpg', '.jpeg', '.bmp')
+
+    def __init__(self, root: str, category: str, split: str = 'train', img_size: int = 224):
+        self.root = Path(root)
+        self.transform = get_transform(img_size)
+        self.mask_transform = T.Compose([
+            T.Resize((img_size, img_size), interpolation=T.InterpolationMode.NEAREST),
+            T.ToTensor(),
+        ])
+        self.samples: list = []
+        self._load(split, category)
+
+    def _load(self, split, category):
+        cat_dir = self.root / category
+        split_dir = cat_dir / split
+        
+        if split == 'train':
+            good_dir = split_dir / 'good'
+            if good_dir.exists():
+                for p in sorted(good_dir.glob('*')):
+                    if p.suffix.lower() in self._EXTS:
+                        self.samples.append((p, None, 0))
+        else:
+            if not split_dir.exists():
+                raise ValueError(f"Split directory {split_dir} does not exist.")
+            
+            for defect_dir in sorted(split_dir.iterdir()):
+                if not defect_dir.is_dir():
+                    continue
+                label = 0 if defect_dir.name == 'good' else 1
+                for p in sorted(defect_dir.glob('*')):
+                    if p.suffix.lower() not in self._EXTS:
+                        continue
+                    
+                    mask_paths = None
+                    if label == 1:
+                        # MVTec LOCO ground truth can be multiple images in a folder named after the image stem
+                        gt_folder = cat_dir / 'ground_truth' / defect_dir.name / p.stem
+                        if gt_folder.exists() and gt_folder.is_dir():
+                            mask_paths = [m for m in gt_folder.glob('*.png')]
+                        else:
+                            # Fallback if there is just a mask file
+                            fallback_mask = cat_dir / 'ground_truth' / defect_dir.name / f"{p.stem}.png"
+                            if fallback_mask.exists():
+                                mask_paths = [fallback_mask]
+                            else:
+                                fallback_mask_2 = cat_dir / 'ground_truth' / defect_dir.name / f"{p.stem}_mask.png"
+                                if fallback_mask_2.exists():
+                                    mask_paths = [fallback_mask_2]
+                                else:
+                                    mask_paths = None
+                                
+                    self.samples.append((p, mask_paths, label))
+
+        if len(self.samples) == 0:
+            msg = f"No samples found for category '{category}', split '{split}'.\n"
+            if not self.root.exists():
+                msg += f"Root directory '{self.root}' does not exist. Please check your data_path setting."
+            elif not cat_dir.exists():
+                subdirs = [p.name for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')]
+                msg += f"Category directory '{category}' not found under root '{self.root}'. Available directories: {subdirs}"
+            else:
+                target_dir = cat_dir / split
+                if not target_dir.exists():
+                    msg += f"Target directory '{target_dir}' does not exist."
+                else:
+                    msg += f"Directory exists but no matching files with extensions {self._EXTS}."
+            raise ValueError(msg)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, mask_paths, label = self.samples[idx]
+        image = self.transform(Image.open(img_path).convert('RGB'))
+        H, W = image.shape[1], image.shape[2]
+        
+        if mask_paths is not None and len(mask_paths) > 0:
+            # Combine all masks with logical OR
+            combined_mask = torch.zeros(1, H, W)
+            for m_path in mask_paths:
+                m_tensor = self.mask_transform(Image.open(m_path).convert('L'))
+                m_tensor = (m_tensor > 0.5).float()
+                combined_mask = torch.max(combined_mask, m_tensor)
+            mask = combined_mask
+        else:
+            mask = torch.zeros(1, H, W)
+            
+        return image, mask, label
+
+
+# ---------------------------------------------------------------------------
+# VisA
+# ---------------------------------------------------------------------------
+
 class VisADataset(Dataset):
     """
     VisA (Visual Anomaly) dataset loader.
@@ -327,9 +439,10 @@ class VisADataset(Dataset):
 # ---------------------------------------------------------------------------
 
 _REGISTRY = {
-    'mvtec':  (MVTecDataset,   MVTEC_CATEGORIES),
-    'mvtec2': (MVTec2Dataset,  MVTEC2_CATEGORIES),
-    'visa':   (VisADataset,    VISA_CATEGORIES),
+    'mvtec':      (MVTecDataset,      MVTEC_CATEGORIES),
+    'mvtec2':     (MVTec2Dataset,     MVTEC2_CATEGORIES),
+    'mvtec_loco': (MVTecLOCODataset,  MVTEC_LOCO_CATEGORIES),
+    'visa':       (VisADataset,       VISA_CATEGORIES),
 }
 
 ALL_CATEGORIES = {name: cats for name, (_, cats) in _REGISTRY.items()}

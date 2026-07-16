@@ -30,7 +30,7 @@ done
 
 if [ -z "$DATA_PATH" ]; then
     echo "Error: --data_path is required."
-    echo "Usage: ./run.sh --dataset <mvtec|visa> --data_path <path> [options]"
+    echo "Usage: ./run.sh --dataset <mvtec|mvtec2|mvtec_loco|visa> --data_path <path> [options]"
     exit 1
 fi
 

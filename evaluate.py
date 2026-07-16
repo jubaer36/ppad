@@ -46,7 +46,7 @@ from model import PPAD
 def parse_args():
     p = argparse.ArgumentParser(description='Evaluate PPAD')
     p.add_argument('--dataset',    default='mvtec',
-                   help='Test dataset name: mvtec | mvtec2 | visa')
+                   help='Test dataset name: mvtec | mvtec2 | mvtec_loco | visa')
     p.add_argument('--data_path',  required=True)
     p.add_argument('--category',   required=True,
                    help='Category name, "all", or comma-separated list')
@@ -57,7 +57,7 @@ def parse_args():
                         '(default: <dataset>/<category>). Use this for cross-dataset '
                         'eval, e.g. --ckpt_tag mvtec/all to load a model trained on MVTec.')
     p.add_argument('--batch_size', type=int, default=4)
-    p.add_argument('--layers',     default='2,5,8,11', help='Comma-separated DINOv2 layers to extract')
+    p.add_argument('--layers',     default='11',          help='Comma-separated DINOv2 layers to extract')
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--vis_dir',    default='visualizations',
                    help='Root directory for per-image artifacts')

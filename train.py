@@ -35,15 +35,15 @@ from model import PPAD
 def parse_args():
     p = argparse.ArgumentParser(description='Train PPAD predictor')
     p.add_argument('--dataset',      default='mvtec',
-                   help='Dataset name: mvtec | mvtec2 | visa')
+                   help='Dataset name: mvtec | mvtec2 | mvtec_loco | visa')
     p.add_argument('--data_path',    required=True,  help='Path to dataset root')
     p.add_argument('--category',     required=True,
                    help='Category name, "all", or comma-separated list (e.g. bottle,cable)')
     p.add_argument('--output_dir',   default='checkpoints', help='Where to save checkpoints')
-    p.add_argument('--patch_grids',  default='4,8,16',     help='Comma-separated list of patch grids (e.g. 4,8,16)')
+    p.add_argument('--patch_grids',  default='8',          help='Comma-separated list of patch grids (e.g. 8)')
     p.add_argument('--img_size',     type=int,   default=224)
     p.add_argument('--encoder',      default='dinov2_vits14')
-    p.add_argument('--layers',       default='2,5,8,11', help='Comma-separated DINOv2 layers to extract')
+    p.add_argument('--layers',       default='11',          help='Comma-separated DINOv2 layers to extract')
     p.add_argument('--epochs',       type=int,   default=50)
     p.add_argument('--batch_size',   type=int,   default=8)
     p.add_argument('--lr',           type=float, default=1e-4)
