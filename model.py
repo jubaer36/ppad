@@ -91,7 +91,7 @@ class PPAD(nn.Module):
     """
 
     def __init__(self, patch_grids: list = None, img_size: int = 224,
-                 encoder_name: str = 'dinov2_vits14', layers: list = None):
+                 encoder_name: str = 'dinov2_vits14', layers: list = None, predictor_layers: int = 2):
         super().__init__()
         self.patch_grids = [4,8,12]
         self.img_size    = img_size
@@ -102,6 +102,7 @@ class PPAD(nn.Module):
             '8': PatchPredictor(
                 embed_dim   = self.encoder.embed_dim,
                 num_patches = 64,
+                num_layers  = predictor_layers,
             )
         })
 

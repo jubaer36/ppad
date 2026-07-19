@@ -327,6 +327,7 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
         img_size     = ckpt['img_size'],
         encoder_name = ckpt['encoder'],
         layers       = ckpt.get('layers', [int(l.strip()) for l in args.layers.split(',')]),
+        predictor_layers = ckpt.get('predictor_layers', 2),
     ).to(device)
     model.predictors.load_state_dict(ckpt['predictors'])
     model.eval()
