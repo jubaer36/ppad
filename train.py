@@ -111,11 +111,11 @@ def train_all(args, dataset_name: str, categories: list):
         for images, _, _ in tqdm(loader, desc=f'Epoch {epoch}/{args.epochs}', leave=False):
             images = images.to(device)
 
-            # ---- forward & predict ----
             outputs = model(images)
             loss = 0.0
-            for g, (hp, ho) in outputs.items():
-                loss += (1.0 - F.cosine_similarity(ho, hp, dim=-1)).mean()
+            for g, (hp, mu, logvar) in outputs.items():
+                var = torch.exp(logvar)
+                loss += F.gaussian_nll_loss(mu, hp, var, eps=1e-6)
             loss /= len(outputs)
 
             optimizer.zero_grad()

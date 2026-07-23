@@ -40,13 +40,13 @@ class DINOv2Encoder(nn.Module):
 
 class PatchPredictor(nn.Module):
     """
-    Predicts the embedding of a target patch given:
+    Predicts the mean (mu) and log-variance (logvar) of a target patch given:
       - hi  : context embedding [B, D]  (image with that patch masked)
       - pos : patch index       [B]     (integer, learned embedding table)
 
     The 2-token sequence [context | query] is fed through a small
-    TransformerEncoder.  The output at the query position is projected
-    to the final predicted embedding ho [B, D].
+    TransformerEncoder. The output at the query position is projected
+    to mu [B, D] and logvar [B, D].
     """
 
     def __init__(self, embed_dim: int, num_patches: int,
@@ -63,16 +63,24 @@ class PatchPredictor(nn.Module):
             norm_first=True,          # pre-norm for training stability
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.out_proj = nn.Sequential(
+        self.mu_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.logvar_proj = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
         )
 
-    def forward(self, hi: torch.Tensor, patch_idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, hi: torch.Tensor, patch_idx: torch.Tensor):
         pos = self.pos_embed(patch_idx)          # [B, D]
         seq = torch.stack([hi, pos], dim=1)      # [B, 2, D]
         out = self.transformer(seq)              # [B, 2, D]
-        return self.out_proj(out[:, 1])          # [B, D]  ← query token output
+        query_out = out[:, 1]                    # [B, D]  ← query token output
+        mu = self.mu_proj(query_out)             # [B, D]
+        logvar = self.logvar_proj(query_out)     # [B, D]
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        return mu, logvar
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +195,7 @@ class PPAD(nn.Module):
         images: [B, 3, H, W] (normalized)
 
         If self.training is True:
-            Returns a dict {g: (hp_g, ho_g)} for each grid size g in self.patch_grids
+            Returns a dict {g: (hp_g, mu_g, logvar_g)} for each grid size g in self.patch_grids
         If self.training is False:
             Returns a dict containing:
                 - 'fused': average fused pixel-level anomaly map [B, 1, H, W]
@@ -206,9 +214,10 @@ class PPAD(nn.Module):
 
             hi_flat  = hi.reshape(B * N, -1)                                # [B*N, D]
             idx_flat = torch.arange(N, device=device).repeat(B)      # [B*N]
-            ho_flat  = self.predictors['8'](hi_flat, idx_flat)           # [B*N, D]
-            ho = ho_flat.view(B, N, -1)                                     # [B, N, D]
-            outputs[g] = (hp, ho)
+            mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat) # [B*N, D], [B*N, D]
+            mu = mu_flat.view(B, N, -1)                                     # [B, N, D]
+            logvar = logvar_flat.view(B, N, -1)                             # [B, N, D]
+            outputs[g] = (hp, mu, logvar)
             return outputs
         else:
             outputs = {}
@@ -219,10 +228,12 @@ class PPAD(nn.Module):
 
                 hi_flat  = hi.reshape(B * N, -1)
                 idx_flat = torch.arange(N, device=device).repeat(B)
-                ho_flat  = self.predictors['8'](hi_flat, idx_flat)
-                ho = ho_flat.view(B, N, -1)
+                mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat)
+                mu = mu_flat.view(B, N, -1)
+                logvar = logvar_flat.view(B, N, -1)
                 
-                scores = 1.0 - F.cosine_similarity(hp, ho, dim=-1)             # [B, N]
+                # Z-score squared anomaly score: (hp - mu)^2 / std^2
+                scores = ((hp - mu) ** 2 / torch.exp(logvar)).mean(dim=-1)     # [B, N]
                 outputs[g] = scores
 
                 # Upsample to pixel-level heatmap
@@ -342,10 +353,11 @@ class PPAD(nn.Module):
                 idx_tensor = torch.tensor(predict_indices, device=device)  # [K]
                 idx_flat = idx_tensor.unsqueeze(0).expand(B, -1).reshape(B * K)  # [B*K]
 
-                ho_flat = self.predictors['8'](hi_flat, idx_flat)  # [B*K, D]
-                ho = ho_flat.view(B, K, -1)                          # [B, K, D]
+                mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat)  # [B*K, D]
+                mu = mu_flat.view(B, K, -1)                          # [B, K, D]
+                logvar = logvar_flat.view(B, K, -1)                  # [B, K, D]
 
-                scores = 1.0 - F.cosine_similarity(hp, ho, dim=-1)   # [B, K]
+                scores = ((hp - mu) ** 2 / torch.exp(logvar)).mean(dim=-1)   # [B, K]
 
                 # Scatter into full score tensor
                 idx_tensor = torch.tensor(predict_indices, device=device)
