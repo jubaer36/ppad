@@ -103,8 +103,9 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
     mask_np = mask_tensor.cpu().numpy()                    # [H, W]
     heat_np = heatmap_tensor.cpu().numpy()                 # [H, W]
 
-    # Map heatmap from fixed [0, 0.5] range to [0, 1] for colormap blending
-    heat_norm = np.clip(heat_np / 0.5, 0.0, 1.0)
+    # Normalize heatmap to [0, 1] using min-max scaling for colormap blending
+    h_min, h_max = heat_np.min(), heat_np.max()
+    heat_norm = (heat_np - h_min) / (h_max - h_min + 1e-8)
 
     # Blend heatmap over image (alpha composite)
     cmap   = plt.get_cmap('hot')
@@ -136,8 +137,8 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
     )
     axes[2].axis('off')
 
-    # Colorbar for anomaly map with fixed [0, 0.5] range
-    sm = plt.cm.ScalarMappable(cmap='hot', norm=Normalize(vmin=0.0, vmax=0.5))
+    # Colorbar for anomaly map
+    sm = plt.cm.ScalarMappable(cmap='hot', norm=Normalize(vmin=h_min, vmax=h_max))
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes[2], fraction=0.046, pad=0.04)
     cbar.ax.yaxis.set_tick_params(color='white')
@@ -189,8 +190,9 @@ def save_patch_grid_visualization(
     status = 'ANOMALY' if label == 1 else 'NORMAL'
     status_color = 'tomato' if label == 1 else 'lightgreen'
 
-    # Panel 1 — Raw patch scores with fixed [0, 0.5] scale
-    im0 = axes[0].imshow(score_grid, cmap='hot', vmin=0.0, vmax=0.5, interpolation='nearest')
+    # Panel 1 — Raw patch scores
+    s_min, s_max = score_grid.min(), score_grid.max()
+    im0 = axes[0].imshow(score_grid, cmap='hot', vmin=s_min, vmax=s_max, interpolation='nearest')
     axes[0].set_title(
         f'Patch Scores ({g}×{g})  [{status}]\nscore={img_score:.3f}',
         color=status_color, fontsize=10, pad=6,
@@ -202,7 +204,7 @@ def save_patch_grid_visualization(
     for r in range(g):
         for c in range(g):
             val = score_grid[r, c]
-            text_color = 'black' if val > 0.25 else 'white'
+            text_color = 'black' if val > (s_min + s_max) / 2 else 'white'
             axes[0].text(c, r, f'{val:.2f}', ha='center', va='center',
                          fontsize=max(5, 9 - g // 3), color=text_color)
     cb0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)

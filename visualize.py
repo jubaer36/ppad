@@ -77,7 +77,7 @@ def main():
 
             fig, axes = plt.subplots(1, 3, figsize=(12, 4))
             axes[0].imshow(img_np);    axes[0].set_title('Image');         axes[0].axis('off')
-            axes[1].imshow(heat_np, cmap='hot', vmin=0.0, vmax=0.5); axes[1].set_title(
+            axes[1].imshow(heat_np, cmap='hot', vmin=heat_np.min(), vmax=heat_np.max()); axes[1].set_title(
                 f'Anomaly Map  ({"ANOMALY" if label else "NORMAL"})');     axes[1].axis('off')
             axes[2].imshow(mask_np, cmap='gray', vmin=0, vmax=1); axes[2].set_title('GT Mask'); axes[2].axis('off')
 
