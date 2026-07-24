@@ -45,6 +45,7 @@ def parse_args():
     p.add_argument('--encoder',      default='dinov2_vits14')
     p.add_argument('--layers',       default='11',          help='Comma-separated DINOv2 layers to extract')
     p.add_argument('--predictor_layers', type=int, default=2, help='Number of layers for the Transformer predictor')
+    p.add_argument('--proj_dim',     type=int,   default=128, help='Bottleneck projection dimension')
     p.add_argument('--epochs',       type=int,   default=50)
     p.add_argument('--batch_size',   type=int,   default=8)
     p.add_argument('--lr',           type=float, default=1e-4)
@@ -83,9 +84,10 @@ def train_all(args, dataset_name: str, categories: list):
     layers = [int(l.strip()) for l in args.layers.split(',')]
     model = PPAD(patch_grids=grids, img_size=args.img_size,
                  encoder_name=args.encoder, layers=layers,
-                 predictor_layers=args.predictor_layers).to(device)
+                 predictor_layers=args.predictor_layers,
+                 proj_dim=args.proj_dim).to(device)
 
-    optimizer = torch.optim.AdamW(model.predictors.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_loss = float('inf')
@@ -97,6 +99,8 @@ def train_all(args, dataset_name: str, categories: list):
     if latest_ckpt_path.exists():
         print(f"  Found latest checkpoint: {latest_ckpt_path}, resuming...")
         ckpt = torch.load(latest_ckpt_path, map_location=device)
+        if 'bottleneck' in ckpt:
+            model.bottleneck.load_state_dict(ckpt['bottleneck'])
         model.predictors.load_state_dict(ckpt['predictors'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
@@ -120,7 +124,7 @@ def train_all(args, dataset_name: str, categories: list):
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.predictors.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), 1.0)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -134,6 +138,7 @@ def train_all(args, dataset_name: str, categories: list):
             ckpt = {
                 'epoch':      epoch,
                 'loss':       best_loss,
+                'bottleneck': model.bottleneck.state_dict(),
                 'predictors': model.predictors.state_dict(),
                 'patch_grids': model.patch_grids,
                 'img_size':   args.img_size,
@@ -142,6 +147,7 @@ def train_all(args, dataset_name: str, categories: list):
                 'categories': categories,
                 'layers':     model.layers,
                 'predictor_layers': args.predictor_layers,
+                'proj_dim':   args.proj_dim,
             }
             torch.save(ckpt, out_dir / 'best.pt')
             print(f'  Saved best checkpoint → {out_dir / "best.pt"}  (loss={best_loss:.4f})')
@@ -150,6 +156,7 @@ def train_all(args, dataset_name: str, categories: list):
         latest_ckpt = {
             'epoch':      epoch,
             'best_loss':  best_loss,
+            'bottleneck': model.bottleneck.state_dict(),
             'predictors': model.predictors.state_dict(),
             'optimizer':  optimizer.state_dict(),
             'scheduler':  scheduler.state_dict(),
@@ -160,6 +167,7 @@ def train_all(args, dataset_name: str, categories: list):
             'categories': categories,
             'layers':     model.layers,
             'predictor_layers': args.predictor_layers,
+            'proj_dim':   args.proj_dim,
         }
         torch.save(latest_ckpt, out_dir / 'latest.pt')
 

@@ -48,7 +48,10 @@ def main():
 
     model = PPAD(patch_grids=ckpt.get('patch_grids', [4, 8, 16]),
                  img_size=ckpt['img_size'],
-                 encoder_name=ckpt['encoder']).to(device)
+                 encoder_name=ckpt['encoder'],
+                 proj_dim=ckpt.get('proj_dim', 128)).to(device)
+    if 'bottleneck' in ckpt:
+        model.bottleneck.load_state_dict(ckpt['bottleneck'])
     model.predictors.load_state_dict(ckpt['predictors'])
     model.eval()
 
@@ -74,9 +77,9 @@ def main():
 
             fig, axes = plt.subplots(1, 3, figsize=(12, 4))
             axes[0].imshow(img_np);    axes[0].set_title('Image');         axes[0].axis('off')
-            axes[1].imshow(heat_np, cmap='hot'); axes[1].set_title(
+            axes[1].imshow(heat_np, cmap='hot', vmin=0.0, vmax=0.5); axes[1].set_title(
                 f'Anomaly Map  ({"ANOMALY" if label else "NORMAL"})');     axes[1].axis('off')
-            axes[2].imshow(mask_np, cmap='gray'); axes[2].set_title('GT Mask'); axes[2].axis('off')
+            axes[2].imshow(mask_np, cmap='gray', vmin=0, vmax=1); axes[2].set_title('GT Mask'); axes[2].axis('off')
 
             plt.tight_layout()
             fig.savefig(out_dir / f'{i:04d}_label{label}.png', dpi=120)

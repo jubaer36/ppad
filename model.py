@@ -50,8 +50,14 @@ class PatchPredictor(nn.Module):
     """
 
     def __init__(self, embed_dim: int, num_patches: int,
-                 num_heads: int = 6, num_layers: int = 2, dropout: float = 0.1):
+                 num_heads: int = 4, num_layers: int = 2, dropout: float = 0.1):
         super().__init__()
+        if embed_dim % num_heads != 0:
+            for h in [8, 4, 2, 1]:
+                if embed_dim % h == 0:
+                    num_heads = h
+                    break
+
         self.pos_embed = nn.Embedding(num_patches, embed_dim)
 
         layer = nn.TransformerEncoderLayer(
@@ -96,23 +102,35 @@ class PPAD(nn.Module):
         img_size    : input image size (square)
         encoder_name: DINOv2 variant (dinov2_vits14 / dinov2_vitb14 / ...)
         layers      : ignored, kept for signature compatibility
+        predictor_layers: number of layers for the Transformer predictor
+        proj_dim    : bottleneck projection dimension for feature dimension reduction
     """
 
     def __init__(self, patch_grids: list = None, img_size: int = 224,
-                 encoder_name: str = 'dinov2_vits14', layers: list = None, predictor_layers: int = 2):
+                 encoder_name: str = 'dinov2_vits14', layers: list = None,
+                 predictor_layers: int = 2, proj_dim: int = 128):
         super().__init__()
         self.patch_grids = [4,8,12]
         self.img_size    = img_size
         self.layers      = [11]
+        self.proj_dim    = proj_dim
 
         self.encoder   = DINOv2Encoder(encoder_name)
+        self.bottleneck = nn.Sequential(
+            nn.Linear(self.encoder.embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim),
+        )
         self.predictors = nn.ModuleDict({
             '8': PatchPredictor(
-                embed_dim   = self.encoder.embed_dim,
+                embed_dim   = proj_dim,
                 num_patches = 64,
                 num_layers  = predictor_layers,
             )
         })
+
+    def trainable_parameters(self):
+        """Return an iterator over all trainable parameters (bottleneck + predictors)."""
+        return list(self.bottleneck.parameters()) + list(self.predictors.parameters())
 
     # ------------------------------------------------------------------
     # Helpers
@@ -195,7 +213,7 @@ class PPAD(nn.Module):
         images: [B, 3, H, W] (normalized)
 
         If self.training is True:
-            Returns a dict {g: (hp_g, mu_g, logvar_g)} for each grid size g in self.patch_grids
+            Returns a dict {g: (hp_proj_g, mu_g, logvar_g)} for each grid size g in self.patch_grids
         If self.training is False:
             Returns a dict containing:
                 - 'fused': average fused pixel-level anomaly map [B, 1, H, W]
@@ -209,31 +227,37 @@ class PPAD(nn.Module):
         if self.training:
             outputs = {}
             with torch.no_grad():
-                hp = self._encode_all_patches(images, g)    # [B, N, D]
-                hi = self._encode_all_contexts(images, g)   # [B, N, D]
+                hp = self._encode_all_patches(images, g)    # [B, N, D_enc]
+                hi = self._encode_all_contexts(images, g)   # [B, N, D_enc]
 
-            hi_flat  = hi.reshape(B * N, -1)                                # [B*N, D]
-            idx_flat = torch.arange(N, device=device).repeat(B)      # [B*N]
-            mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat) # [B*N, D], [B*N, D]
-            mu = mu_flat.view(B, N, -1)                                     # [B, N, D]
-            logvar = logvar_flat.view(B, N, -1)                             # [B, N, D]
-            outputs[g] = (hp, mu, logvar)
+            hp_proj = self.bottleneck(hp)                   # [B, N, proj_dim]
+            hi_proj = self.bottleneck(hi)                   # [B, N, proj_dim]
+
+            hi_flat  = hi_proj.reshape(B * N, -1)                         # [B*N, proj_dim]
+            idx_flat = torch.arange(N, device=device).repeat(B)           # [B*N]
+            mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat) # [B*N, proj_dim], [B*N, proj_dim]
+            mu = mu_flat.view(B, N, -1)                                     # [B, N, proj_dim]
+            logvar = logvar_flat.view(B, N, -1)                             # [B, N, proj_dim]
+            outputs[g] = (hp_proj, mu, logvar)
             return outputs
         else:
             outputs = {}
             H, W = images.shape[2], images.shape[3]
             with torch.no_grad():
-                hp = self._encode_all_patches(images, g)    # [B, N, D]
-                hi = self._encode_all_contexts(images, g)   # [B, N, D]
+                hp = self._encode_all_patches(images, g)    # [B, N, D_enc]
+                hi = self._encode_all_contexts(images, g)   # [B, N, D_enc]
 
-                hi_flat  = hi.reshape(B * N, -1)
+                hp_proj = self.bottleneck(hp)               # [B, N, proj_dim]
+                hi_proj = self.bottleneck(hi)               # [B, N, proj_dim]
+
+                hi_flat  = hi_proj.reshape(B * N, -1)
                 idx_flat = torch.arange(N, device=device).repeat(B)
                 mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat)
                 mu = mu_flat.view(B, N, -1)
                 logvar = logvar_flat.view(B, N, -1)
                 
-                # Z-score squared anomaly score: (hp - mu)^2 / std^2
-                scores = ((hp - mu) ** 2 / torch.exp(logvar)).mean(dim=-1)     # [B, N]
+                # Z-score squared anomaly score in bottleneck space
+                scores = ((hp_proj - mu) ** 2 / torch.exp(logvar)).mean(dim=-1)     # [B, N]
                 outputs[g] = scores
 
                 # Upsample to pixel-level heatmap
@@ -340,24 +364,28 @@ class PPAD(nn.Module):
                 K = len(predict_indices)
 
                 # 1. Encode isolated crops for the patches we want to predict
-                hp = self._encode_patches_subset(images, g, predict_indices)  # [B, K, D]
+                hp = self._encode_patches_subset(images, g, predict_indices)     # [B, K, D_enc]
 
                 # 2. Encode context (all masked patches zeroed simultaneously)
-                hi = self._encode_checkerboard_context(images, g, mask_indices)  # [B, D]
+                hi = self._encode_checkerboard_context(images, g, mask_indices) # [B, D_enc]
+
+                # Project through bottleneck
+                hp_proj = self.bottleneck(hp)                                    # [B, K, proj_dim]
+                hi_proj = self.bottleneck(hi)                                    # [B, proj_dim]
 
                 # 3. Predict embeddings for each masked patch
-                hi_expanded = hi.unsqueeze(1).expand(B, K, -1)  # [B, K, D]
-                hi_flat = hi_expanded.reshape(B * K, -1)        # [B*K, D]
+                hi_expanded = hi_proj.unsqueeze(1).expand(B, K, -1)              # [B, K, proj_dim]
+                hi_flat = hi_expanded.reshape(B * K, -1)                         # [B*K, proj_dim]
 
                 # Patch position indices
-                idx_tensor = torch.tensor(predict_indices, device=device)  # [K]
-                idx_flat = idx_tensor.unsqueeze(0).expand(B, -1).reshape(B * K)  # [B*K]
+                idx_tensor = torch.tensor(predict_indices, device=device)        # [K]
+                idx_flat = idx_tensor.unsqueeze(0).expand(B, -1).reshape(B * K) # [B*K]
 
-                mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat)  # [B*K, D]
-                mu = mu_flat.view(B, K, -1)                          # [B, K, D]
-                logvar = logvar_flat.view(B, K, -1)                  # [B, K, D]
+                mu_flat, logvar_flat = self.predictors['8'](hi_flat, idx_flat)   # [B*K, proj_dim]
+                mu = mu_flat.view(B, K, -1)                                      # [B, K, proj_dim]
+                logvar = logvar_flat.view(B, K, -1)                              # [B, K, proj_dim]
 
-                scores = ((hp - mu) ** 2 / torch.exp(logvar)).mean(dim=-1)   # [B, K]
+                scores = ((hp_proj - mu) ** 2 / torch.exp(logvar)).mean(dim=-1)  # [B, K]
 
                 # Scatter into full score tensor
                 idx_tensor = torch.tensor(predict_indices, device=device)
@@ -384,4 +412,5 @@ class PPAD(nn.Module):
         if was_training:
             self.train()
         return outputs['fused']
+
 

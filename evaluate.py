@@ -103,9 +103,8 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
     mask_np = mask_tensor.cpu().numpy()                    # [H, W]
     heat_np = heatmap_tensor.cpu().numpy()                 # [H, W]
 
-    # Normalize heatmap to [0, 1] for display
-    h_min, h_max = heat_np.min(), heat_np.max()
-    heat_norm = (heat_np - h_min) / (h_max - h_min + 1e-8)
+    # Map heatmap from fixed [0, 0.5] range to [0, 1] for colormap blending
+    heat_norm = np.clip(heat_np / 0.5, 0.0, 1.0)
 
     # Blend heatmap over image (alpha composite)
     cmap   = plt.get_cmap('hot')
@@ -137,8 +136,8 @@ def save_visualization(img_tensor, mask_tensor, heatmap_tensor,
     )
     axes[2].axis('off')
 
-    # Colorbar for anomaly map
-    sm = plt.cm.ScalarMappable(cmap='hot', norm=Normalize(vmin=h_min, vmax=h_max))
+    # Colorbar for anomaly map with fixed [0, 0.5] range
+    sm = plt.cm.ScalarMappable(cmap='hot', norm=Normalize(vmin=0.0, vmax=0.5))
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes[2], fraction=0.046, pad=0.04)
     cbar.ax.yaxis.set_tick_params(color='white')
@@ -190,8 +189,8 @@ def save_patch_grid_visualization(
     status = 'ANOMALY' if label == 1 else 'NORMAL'
     status_color = 'tomato' if label == 1 else 'lightgreen'
 
-    # Panel 1 — Raw patch scores
-    im0 = axes[0].imshow(score_grid, cmap='hot', interpolation='nearest')
+    # Panel 1 — Raw patch scores with fixed [0, 0.5] scale
+    im0 = axes[0].imshow(score_grid, cmap='hot', vmin=0.0, vmax=0.5, interpolation='nearest')
     axes[0].set_title(
         f'Patch Scores ({g}×{g})  [{status}]\nscore={img_score:.3f}',
         color=status_color, fontsize=10, pad=6,
@@ -203,7 +202,7 @@ def save_patch_grid_visualization(
     for r in range(g):
         for c in range(g):
             val = score_grid[r, c]
-            text_color = 'black' if val > (score_grid.max() + score_grid.min()) / 2 else 'white'
+            text_color = 'black' if val > 0.25 else 'white'
             axes[0].text(c, r, f'{val:.2f}', ha='center', va='center',
                          fontsize=max(5, 9 - g // 3), color=text_color)
     cb0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
@@ -328,7 +327,10 @@ def evaluate_category(args, dataset_name: str, category: str, ckpt_tag: str) -> 
         encoder_name = ckpt['encoder'],
         layers       = ckpt.get('layers', [int(l.strip()) for l in args.layers.split(',')]),
         predictor_layers = ckpt.get('predictor_layers', 2),
+        proj_dim     = ckpt.get('proj_dim', 128),
     ).to(device)
+    if 'bottleneck' in ckpt:
+        model.bottleneck.load_state_dict(ckpt['bottleneck'])
     model.predictors.load_state_dict(ckpt['predictors'])
     model.eval()
 
