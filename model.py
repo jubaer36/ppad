@@ -2,8 +2,8 @@
 model.py - PPAD: Patch Predictive Anomaly Detection
 
 Pipeline for each patch i in image x:
-  hp = Encoder(crop(x, i))          # isolated patch embedding
-  hi = Encoder(mask(x, i))          # context embedding (image with patch i zeroed)
+  hp = Encoder(x)[i]                # patch token embedding directly from whole image
+  hi = mean(Encoder(x)[j] for j != i) # context embedding (average of unmasked patch tokens)
   ho = Predictor(hi, pos_i)         # predicted patch embedding
   score_i = 1 - cosine_sim(hp, ho)  # anomaly score for patch i
 """
@@ -32,6 +32,27 @@ class DINOv2Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, 3, 224, 224] normalized → returns [B, D]"""
         return self.model(x)
+
+    @torch.no_grad()
+    def get_patch_tokens(self, x: torch.Tensor, g: int = 8) -> torch.Tensor:
+        """
+        Pass the whole image x [B, 3, H, W] to DINOv2 and extract patch tokens [B, g*g, D].
+        If the patch token grid size does not match g x g, adaptive average pooling is applied.
+        """
+        features = self.model.forward_features(x)
+        tokens = features['x_norm_patchtokens']  # [B, N_patches, D]
+        B, N, D = tokens.shape
+        h_patches = int(N ** 0.5)
+        w_patches = h_patches
+        if h_patches * w_patches != N:
+            patch_size = getattr(self.model, 'patch_size', 14)
+            h_patches = x.shape[2] // patch_size
+            w_patches = x.shape[3] // patch_size
+        tokens_grid = tokens.view(B, h_patches, w_patches, D).permute(0, 3, 1, 2)  # [B, D, h_patches, w_patches]
+        if (h_patches, w_patches) != (g, g):
+            tokens_grid = F.adaptive_avg_pool2d(tokens_grid, (g, g))
+        hp = tokens_grid.permute(0, 2, 3, 1).reshape(B, g * g, D)  # [B, g*g, D]
+        return hp
 
 
 # ---------------------------------------------------------------------------
@@ -154,55 +175,28 @@ class PPAD(nn.Module):
 
     def _encode_all_patches(self, images: torch.Tensor, g: int) -> torch.Tensor:
         """
-        Crop every patch from every image, resize to img_size, encode.
+        Extract patch tokens directly from the whole image as hp.
         images : [B, 3, H, W]
         returns: [B, N, D]
         """
-        B, N = images.shape[0], g * g
-        crops = []
-        for idx in range(N):
-            r0, r1, c0, c1 = self._patch_coords(idx, g)
-            p = images[:, :, r0:r1, c0:c1]                         # [B, 3, ps, ps]
-            p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
-            crops.append(p)                                          # [B, 3, H, W]
+        return self.encoder.get_patch_tokens(images, g)
 
-        # Stack → [B*N, 3, H, W]
-        crops_cat = torch.cat(crops, dim=0)                         # [B*N, 3, H, W]
-        
-        # Encode in chunks to prevent CUDA OOM
-        max_batch_size = 64
-        hp_list = []
-        for i in range(0, crops_cat.shape[0], max_batch_size):
-            chunk = crops_cat[i:i + max_batch_size]
-            hp_list.append(self.encoder(chunk))                     # [B_chunk, D]
-        hp_cat = torch.cat(hp_list, dim=0)                          # [B*N, D]
-        return hp_cat.view(N, B, -1).permute(1, 0, 2)               # [B, N, D]
-
-    def _encode_all_contexts(self, images: torch.Tensor, g: int) -> torch.Tensor:
+    def _encode_all_contexts(self, images: torch.Tensor, g: int,
+                             tokens: torch.Tensor = None) -> torch.Tensor:
         """
-        For each patch position, zero it out and encode the resulting image.
+        Extract patch tokens from the full image and compute context embeddings
+        by masking each corresponding patch token (averaging the remaining N-1 tokens).
         images : [B, 3, H, W]
+        tokens : optional precomputed patch tokens [B, N, D]
         returns: [B, N, D]
         """
-        B, N = images.shape[0], g * g
-        masked_list = []
-        for idx in range(N):
-            r0, r1, c0, c1 = self._patch_coords(idx, g)
-            m = images.clone()
-            m[:, :, r0:r1, c0:c1] = 0.0   # 0 ≈ ImageNet mean after normalization
-            masked_list.append(m)           # [B, 3, H, W]
-
-        # Stack → [B*N, 3, H, W]
-        masked_cat = torch.cat(masked_list, dim=0)                  # [B*N, 3, H, W]
-        
-        # Encode in chunks to prevent CUDA OOM
-        max_batch_size = 64
-        hi_list = []
-        for i in range(0, masked_cat.shape[0], max_batch_size):
-            chunk = masked_cat[i:i + max_batch_size]
-            hi_list.append(self.encoder(chunk))                     # [B_chunk, D]
-        hi_cat = torch.cat(hi_list, dim=0)                          # [B*N, D]
-        return hi_cat.view(N, B, -1).permute(1, 0, 2)               # [B, N, D]
+        if tokens is None:
+            tokens = self.encoder.get_patch_tokens(images, g)
+        B, N, D = tokens.shape
+        if N <= 1:
+            return torch.zeros_like(tokens)
+        total_sum = tokens.sum(dim=1, keepdim=True)
+        return (total_sum - tokens) / (N - 1)
 
     # ------------------------------------------------------------------
     # Forward
@@ -228,7 +222,7 @@ class PPAD(nn.Module):
             outputs = {}
             with torch.no_grad():
                 hp = self._encode_all_patches(images, g)    # [B, N, D_enc]
-                hi = self._encode_all_contexts(images, g)   # [B, N, D_enc]
+                hi = self._encode_all_contexts(images, g, tokens=hp)   # [B, N, D_enc]
 
             hp_proj = self.bottleneck(hp)                   # [B, N, proj_dim]
             hi_proj = self.bottleneck(hi)                   # [B, N, proj_dim]
@@ -291,43 +285,32 @@ class PPAD(nn.Module):
     def _encode_patches_subset(self, images: torch.Tensor, g: int,
                                indices: list) -> torch.Tensor:
         """
-        Crop and encode only the patches at the given indices.
+        Extract patch tokens directly from the whole image and return only the subset at indices.
         images : [B, 3, H, W]
         indices: list of patch indices to encode
         returns: [B, len(indices), D]
         """
-        B = images.shape[0]
-        K = len(indices)
-        crops = []
-        for idx in indices:
-            r0, r1, c0, c1 = self._patch_coords(idx, g)
-            p = images[:, :, r0:r1, c0:c1]
-            p = F.interpolate(p, self.img_size, mode='bilinear', align_corners=False)
-            crops.append(p)
-
-        crops_cat = torch.cat(crops, dim=0)                         # [B*K, 3, H, W]
-
-        max_batch_size = 64
-        hp_list = []
-        for i in range(0, crops_cat.shape[0], max_batch_size):
-            chunk = crops_cat[i:i + max_batch_size]
-            hp_list.append(self.encoder(chunk))
-        hp_cat = torch.cat(hp_list, dim=0)                          # [B*K, D]
-        return hp_cat.view(K, B, -1).permute(1, 0, 2)               # [B, K, D]
+        hp_all = self._encode_all_patches(images, g)                # [B, N, D]
+        return hp_all[:, indices, :]                                # [B, len(indices), D]
 
     def _encode_checkerboard_context(self, images: torch.Tensor, g: int,
-                                     mask_indices: list) -> torch.Tensor:
+                                     mask_indices: list,
+                                     tokens: torch.Tensor = None) -> torch.Tensor:
         """
-        Zero out ALL patches at mask_indices simultaneously, encode once.
+        Extract patch tokens from the full image and compute context embedding
+        by masking ALL tokens at mask_indices simultaneously (averaging the remaining tokens).
         images      : [B, 3, H, W]
         mask_indices: list of patch indices to zero out
+        tokens      : optional precomputed patch tokens [B, N, D]
         returns     : [B, D]  (single context embedding per image)
         """
-        m = images.clone()
-        for idx in mask_indices:
-            r0, r1, c0, c1 = self._patch_coords(idx, g)
-            m[:, :, r0:r1, c0:c1] = 0.0
-        return self.encoder(m)                                      # [B, D]
+        if tokens is None:
+            tokens = self.encoder.get_patch_tokens(images, g)
+        N = tokens.shape[1]
+        keep_indices = [i for i in range(N) if i not in mask_indices]
+        if not keep_indices:
+            return torch.zeros(tokens.shape[0], tokens.shape[2], device=tokens.device, dtype=tokens.dtype)
+        return tokens[:, keep_indices, :].mean(dim=1)
 
     # ------------------------------------------------------------------
     # Checkerboard forward (eval only)
@@ -357,17 +340,18 @@ class PPAD(nn.Module):
         all_scores = torch.zeros(B, N, device=device)
 
         with torch.no_grad():
+            hp_all = self._encode_all_patches(images, g)                         # [B, N, D_enc]
             for mask_indices, predict_indices in [
                 (black_idx, black_idx),   # Pass 1: mask black, predict black
                 (white_idx, white_idx),   # Pass 2: mask white, predict white
             ]:
                 K = len(predict_indices)
 
-                # 1. Encode isolated crops for the patches we want to predict
-                hp = self._encode_patches_subset(images, g, predict_indices)     # [B, K, D_enc]
+                # 1. Extract patch tokens for the patches we want to predict
+                hp = hp_all[:, predict_indices, :]                               # [B, K, D_enc]
 
-                # 2. Encode context (all masked patches zeroed simultaneously)
-                hi = self._encode_checkerboard_context(images, g, mask_indices) # [B, D_enc]
+                # 2. Encode context (mask all mask_indices in patch tokens)
+                hi = self._encode_checkerboard_context(images, g, mask_indices, tokens=hp_all) # [B, D_enc]
 
                 # Project through bottleneck
                 hp_proj = self.bottleneck(hp)                                    # [B, K, proj_dim]
